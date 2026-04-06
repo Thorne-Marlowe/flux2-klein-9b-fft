@@ -53,7 +53,7 @@ python -m ai-toolkit run configs/train_fft_klein_base.yaml
 accelerate launch --num_processes=2 scripts/train_klein_ddp.py configs/train_fft_klein_base.yaml
 ```
 
-### 4. Training (Standalone)
+### 4. Training (Standalone - Single GPU)
 
 ```bash
 python scripts/train_klein_standalone.py \
@@ -64,6 +64,31 @@ python scripts/train_klein_standalone.py \
   --steps 40000 \
   --lr 3e-5
 ```
+
+### 5. Training (Multi-GPU DDP)
+
+```bash
+# 4x GPU DDP training
+accelerate launch --num_processes=4 --multi_gpu \
+  scripts/train_klein_standalone.py \
+  --model_path black-forest-labs/FLUX.2-klein-base-4B \
+  --data_dir /path/to/images \
+  --output_dir /path/to/output \
+  --batch_size 4 \
+  --grad_accum 2 \
+  --steps 40000 \
+  --lr 3e-5
+
+# Resume from checkpoint
+accelerate launch --num_processes=4 --multi_gpu \
+  scripts/train_klein_standalone.py \
+  --model_path black-forest-labs/FLUX.2-klein-base-4B \
+  --data_dir /path/to/images \
+  --output_dir /path/to/output \
+  --resume_from /path/to/output/checkpoint-5000/accelerator_state
+```
+
+> With DDP, effective batch size = `batch_size x grad_accum x num_gpus`. For example, `--batch_size 4 --grad_accum 2` on 4 GPUs = effective batch 32.
 
 ## Models Supported
 

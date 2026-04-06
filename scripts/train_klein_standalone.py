@@ -3,10 +3,21 @@ Standalone Full Fine-tuning for Flux2 Klein-base 4B/9B
 
 No external framework dependencies (ai-toolkit, kohya, etc.).
 Supports gradient checkpointing, AdamW8bit, resolution bucketing,
-EMA, and sample generation during training.
+EMA, sample generation, and Multi-GPU DDP training.
 
 Usage:
+  # Single GPU
   python scripts/train_klein_standalone.py \
+    --model_path black-forest-labs/FLUX.2-klein-base-4B \
+    --data_dir /path/to/images \
+    --output_dir /path/to/output \
+    --batch_size 4 \
+    --steps 40000 \
+    --lr 3e-5
+
+  # Multi-GPU DDP (4x)
+  accelerate launch --num_processes=4 --multi_gpu \
+    scripts/train_klein_standalone.py \
     --model_path black-forest-labs/FLUX.2-klein-base-4B \
     --data_dir /path/to/images \
     --output_dir /path/to/output \
@@ -300,11 +311,13 @@ def train(args):
 
     device = accelerator.device
     dtype = torch.bfloat16
+    is_main = accelerator.is_main_process
+    num_processes = accelerator.num_processes
 
-    # Load model
-    if accelerator.is_main_process:
-        print("Loading Flux2 Klein pipeline...")
+    if is_main:
+        print(f"Loading Flux2 Klein pipeline... ({num_processes} GPU{'s' if num_processes > 1 else ''})")
 
+    # Each process loads the pipeline independently (DDP: full model per GPU)
     pipe = Flux2KleinPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
     transformer = pipe.transformer
     vae = pipe.vae
@@ -321,7 +334,7 @@ def train(args):
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
-    # Move frozen models
+    # Move frozen models to local device
     vae.to(device, dtype=dtype)
     text_encoder.to(device, dtype=dtype)
 
@@ -359,58 +372,80 @@ def train(args):
         drop_last=True,
     )
 
-    # LR scheduler
+    # LR scheduler with warmup
+    warmup_steps = min(args.warmup_steps, args.steps // 10)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.steps, eta_min=args.lr * 0.1
+        optimizer, T_max=args.steps - warmup_steps, eta_min=args.lr * 0.1
     )
 
-    # Prepare with accelerator
+    # Prepare with accelerator (wraps transformer in DDP, shards dataloader)
     transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, dataloader, lr_scheduler
     )
 
-    # EMA
+    # EMA (only on main process to save memory on other GPUs)
     ema = None
-    if args.use_ema:
+    if args.use_ema and is_main:
         ema = EMAModel(accelerator.unwrap_model(transformer), decay=args.ema_decay)
 
     # Training state
     global_step = 0
-    os.makedirs(args.output_dir, exist_ok=True)
-    samples_dir = os.path.join(args.output_dir, "samples")
-    os.makedirs(samples_dir, exist_ok=True)
+    if is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
+        samples_dir = os.path.join(args.output_dir, "samples")
+        os.makedirs(samples_dir, exist_ok=True)
 
-    if accelerator.is_main_process:
+    # Resume from checkpoint
+    if args.resume_from:
+        accelerator.load_state(args.resume_from)
+        global_step = int(os.path.basename(args.resume_from).split("-")[-1])
+        if is_main:
+            print(f"Resumed from step {global_step}")
+
+    if is_main:
+        effective_batch = args.batch_size * args.grad_accum * num_processes
         print(f"Training config:")
         print(f"  Model: {args.model_path}")
+        print(f"  GPUs: {num_processes}")
         print(f"  Steps: {args.steps}")
-        print(f"  Batch size: {args.batch_size} x {args.grad_accum} = {args.batch_size * args.grad_accum}")
+        print(f"  Per-GPU batch: {args.batch_size}")
+        print(f"  Grad accum: {args.grad_accum}")
+        print(f"  Effective batch: {args.batch_size} x {args.grad_accum} x {num_processes} = {effective_batch}")
         print(f"  LR: {args.lr}")
+        print(f"  Warmup: {warmup_steps} steps")
         print(f"  Optimizer: {args.optimizer}")
         print(f"  EMA: {args.use_ema} (decay={args.ema_decay})")
         print(f"  Gradient checkpointing: {args.gradient_checkpointing}")
         print(f"  Dataset: {len(dataset)} samples")
+        print(f"  Samples/epoch: {len(dataset)} / {effective_batch} = {len(dataset) // effective_batch} steps")
 
     # Pipeline utilities for packing
     prepare_latent_ids = Flux2KleinPipeline._prepare_latent_ids
     prepare_text_ids = Flux2KleinPipeline._prepare_text_ids
     get_qwen3_embeds = Flux2KleinPipeline._get_qwen3_prompt_embeds
 
-    progress = tqdm(total=args.steps, desc="Training", disable=not accelerator.is_main_process)
+    progress = tqdm(
+        total=args.steps, initial=global_step, desc="Training",
+        disable=not is_main,
+    )
+
+    loss_accumulator = 0.0
+    log_steps = 0
 
     while global_step < args.steps:
+        transformer.train()
         for batch in dataloader:
             if global_step >= args.steps:
                 break
 
             with accelerator.accumulate(transformer):
-                # Encode images
+                # Encode images (VAE is per-GPU, no communication needed)
                 if "latents" in batch:
                     latents = batch["latents"].to(device, dtype=dtype)
                 else:
                     latents = encode_images_klein(vae, batch["pixel_values"], device, dtype)
 
-                # Encode text
+                # Encode text (text encoder is per-GPU)
                 with torch.no_grad():
                     prompt_embeds = get_qwen3_embeds(
                         text_encoder=text_encoder,
@@ -423,7 +458,6 @@ def train(args):
 
                 # Flow matching: sample timestep and noise
                 bsz = latents.shape[0]
-                # Sigmoid sampling for timesteps (biased toward middle)
                 u = torch.sigmoid(torch.randn(bsz, device=device))
                 timesteps = (u * 1000).long().clamp(0, 999)
                 sigmas = get_sigmas(timesteps, n_dim=4, dtype=dtype)
@@ -438,7 +472,7 @@ def train(args):
 
                 txt_ids = prepare_text_ids(prompt_embeds).to(device)
 
-                # Forward pass
+                # Forward pass (DDP handles gradient sync)
                 noise_pred = transformer(
                     hidden_states=noisy_packed,
                     timestep=timesteps.float() / 1000.0,
@@ -465,68 +499,104 @@ def train(args):
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
                 optimizer.step()
-                lr_scheduler.step()
+
+                # LR warmup
+                if global_step < warmup_steps:
+                    warmup_factor = (global_step + 1) / warmup_steps
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = args.lr * warmup_factor
+                else:
+                    lr_scheduler.step()
+
                 optimizer.zero_grad()
 
             if accelerator.sync_gradients:
                 global_step += 1
-                progress.update(1)
-                progress.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr_scheduler.get_last_lr()[0]:.2e}")
+                current_loss = loss.item()
+                loss_accumulator += current_loss
+                log_steps += 1
 
+                progress.update(1)
+                progress.set_postfix(
+                    loss=f"{current_loss:.4f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+                    gpu=num_processes,
+                )
+
+                # EMA update (main process only)
                 if ema is not None:
                     ema.update(accelerator.unwrap_model(transformer))
 
-                # Save checkpoint
-                if global_step % args.save_every == 0 and accelerator.is_main_process:
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    os.makedirs(save_path, exist_ok=True)
-                    unwrapped = accelerator.unwrap_model(transformer)
+                # Save checkpoint (all processes wait via barrier)
+                if global_step % args.save_every == 0:
+                    if is_main:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        os.makedirs(save_path, exist_ok=True)
+                        unwrapped = accelerator.unwrap_model(transformer)
 
-                    if ema is not None:
-                        ema.apply(unwrapped)
+                        if ema is not None:
+                            ema.apply(unwrapped)
 
-                    unwrapped.save_pretrained(
-                        os.path.join(save_path, "transformer"),
-                        safe_serialization=True,
-                    )
+                        unwrapped.save_pretrained(
+                            os.path.join(save_path, "transformer"),
+                            safe_serialization=True,
+                        )
 
-                    if ema is not None:
-                        ema.restore(unwrapped)
+                        if ema is not None:
+                            ema.restore(unwrapped)
 
-                    print(f"\nSaved checkpoint at step {global_step}")
+                        # Also save full accelerator state for resuming
+                        accelerator.save_state(
+                            os.path.join(save_path, "accelerator_state")
+                        )
 
-                # Generate sample
-                if (global_step % args.sample_every == 0 and
-                        accelerator.is_main_process and args.sample_prompts):
-                    unwrapped = accelerator.unwrap_model(transformer)
-                    if ema is not None:
-                        ema.apply(unwrapped)
+                        avg_loss = loss_accumulator / max(log_steps, 1)
+                        print(f"\nStep {global_step}: saved checkpoint (avg_loss={avg_loss:.4f})")
+                        loss_accumulator = 0.0
+                        log_steps = 0
 
-                    sample_pipe = Flux2KleinPipeline(
-                        scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(
-                            args.model_path, subfolder="scheduler"
-                        ),
-                        text_encoder=text_encoder,
-                        tokenizer=tokenizer,
-                        vae=vae,
-                        transformer=unwrapped,
-                    )
-                    for pi, prompt in enumerate(args.sample_prompts):
-                        out_path = os.path.join(samples_dir, f"step{global_step}_p{pi}.png")
-                        generate_sample(sample_pipe, prompt, out_path)
-                    del sample_pipe
+                    accelerator.wait_for_everyone()
 
-                    if ema is not None:
-                        ema.restore(unwrapped)
+                # Generate sample (main process only, others wait)
+                if (global_step % args.sample_every == 0 and args.sample_prompts):
+                    if is_main:
+                        unwrapped = accelerator.unwrap_model(transformer)
+                        unwrapped.eval()
+                        if ema is not None:
+                            ema.apply(unwrapped)
+
+                        sample_pipe = Flux2KleinPipeline(
+                            scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(
+                                args.model_path, subfolder="scheduler"
+                            ),
+                            text_encoder=text_encoder,
+                            tokenizer=tokenizer,
+                            vae=vae,
+                            transformer=unwrapped,
+                        )
+                        samples_dir = os.path.join(args.output_dir, "samples")
+                        for pi, prompt in enumerate(args.sample_prompts):
+                            out_path = os.path.join(samples_dir, f"step{global_step}_p{pi}.png")
+                            generate_sample(sample_pipe, prompt, out_path)
+                            print(f"  Sample {pi}: {out_path}")
+                        del sample_pipe
+                        unwrapped.train()
+
+                        if ema is not None:
+                            ema.restore(unwrapped)
+
+                    accelerator.wait_for_everyone()
 
                 # Log
-                if global_step % args.log_every == 0 and accelerator.is_main_process:
-                    print(f"Step {global_step}/{args.steps} | Loss: {loss.item():.4f} | LR: {lr_scheduler.get_last_lr()[0]:.2e}")
+                if global_step % args.log_every == 0 and is_main:
+                    avg_loss = loss_accumulator / max(log_steps, 1)
+                    print(f"Step {global_step}/{args.steps} | Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
     progress.close()
+    accelerator.wait_for_everyone()
 
     # Final save
-    if accelerator.is_main_process:
+    if is_main:
         save_path = os.path.join(args.output_dir, "final")
         os.makedirs(save_path, exist_ok=True)
         unwrapped = accelerator.unwrap_model(transformer)
@@ -537,6 +607,8 @@ def train(args):
             safe_serialization=True,
         )
         print(f"\nTraining complete! Final model saved to {save_path}")
+
+    accelerator.wait_for_everyone()
 
 
 def main():
@@ -556,8 +628,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--optimizer", type=str, default="adamw8bit", choices=["adamw", "adamw8bit", "adafactor"])
+    parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint dir to resume from")
     # EMA
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
