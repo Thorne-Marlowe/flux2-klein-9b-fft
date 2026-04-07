@@ -302,10 +302,17 @@ def generate_sample(pipeline, prompt, output_path, steps=25, guidance=3.5):
 # ---------------------------------------------------------------------------
 
 def train(args):
+    # Setup loggers
+    log_with = []
+    if args.log_dir:
+        log_with.append("tensorboard")
+    if args.wandb:
+        log_with.append("wandb")
+
     accelerator = Accelerator(
         gradient_accumulation_steps=args.grad_accum,
         mixed_precision="bf16",
-        log_with="tensorboard" if args.log_dir else None,
+        log_with=log_with if log_with else None,
         project_dir=args.log_dir,
     )
 
@@ -418,6 +425,32 @@ def train(args):
         print(f"  Gradient checkpointing: {args.gradient_checkpointing}")
         print(f"  Dataset: {len(dataset)} samples")
         print(f"  Samples/epoch: {len(dataset)} / {effective_batch} = {len(dataset) // effective_batch} steps")
+        print(f"  Wandb: {args.wandb}")
+
+    # Initialize trackers (wandb/tensorboard)
+    if is_main and log_with:
+        init_kwargs = {}
+        if args.wandb:
+            init_kwargs["wandb"] = {
+                "name": args.wandb_run_name or f"klein_fft_{args.steps}steps",
+                "tags": ["klein", "fft", "flux2"],
+            }
+        accelerator.init_trackers(
+            project_name=args.wandb_project or "flux2-klein-finetune",
+            config={
+                "model": args.model_path,
+                "steps": args.steps,
+                "batch_size": args.batch_size,
+                "grad_accum": args.grad_accum,
+                "effective_batch": args.batch_size * args.grad_accum * num_processes,
+                "lr": args.lr,
+                "optimizer": args.optimizer,
+                "ema": args.use_ema,
+                "dataset_size": len(dataset),
+                "num_gpus": num_processes,
+            },
+            init_kwargs=init_kwargs,
+        )
 
     # Pipeline utilities for packing
     prepare_latent_ids = Flux2KleinPipeline._prepare_latent_ids
@@ -565,21 +598,28 @@ def train(args):
                         if ema is not None:
                             ema.apply(unwrapped)
 
-                        sample_pipe = Flux2KleinPipeline(
-                            scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(
-                                args.model_path, subfolder="scheduler"
-                            ),
-                            text_encoder=text_encoder,
-                            tokenizer=tokenizer,
-                            vae=vae,
-                            transformer=unwrapped,
-                        )
-                        samples_dir = os.path.join(args.output_dir, "samples")
-                        for pi, prompt in enumerate(args.sample_prompts):
-                            out_path = os.path.join(samples_dir, f"step{global_step}_p{pi}.png")
-                            generate_sample(sample_pipe, prompt, out_path)
-                            print(f"  Sample {pi}: {out_path}")
-                        del sample_pipe
+                        try:
+                            sample_pipe = Flux2KleinPipeline(
+                                scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(
+                                    args.model_path, subfolder="scheduler"
+                                ),
+                                text_encoder=text_encoder,
+                                tokenizer=tokenizer,
+                                vae=vae,
+                                transformer=unwrapped,
+                            )
+                            samples_dir = os.path.join(args.output_dir, "samples")
+                            for pi, prompt in enumerate(args.sample_prompts):
+                                out_path = os.path.join(samples_dir, f"step{global_step}_p{pi}.png")
+                                with torch.autocast(device_type="cuda", dtype=dtype):
+                                    generate_sample(sample_pipe, prompt, out_path)
+                                print(f"  Sample {pi}: {out_path}")
+                            del sample_pipe
+                            torch.cuda.empty_cache()
+                        except Exception as e:
+                            print(f"  Sample generation failed: {e}")
+                            import traceback
+                            traceback.print_exc()
                         unwrapped.train()
 
                         if ema is not None:
@@ -591,6 +631,12 @@ def train(args):
                 if global_step % args.log_every == 0 and is_main:
                     avg_loss = loss_accumulator / max(log_steps, 1)
                     print(f"Step {global_step}/{args.steps} | Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+                    if log_with:
+                        accelerator.log({
+                            "train/loss": avg_loss,
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/step": global_step,
+                        }, step=global_step)
 
     progress.close()
     accelerator.wait_for_everyone()
@@ -608,6 +654,8 @@ def train(args):
         )
         print(f"\nTraining complete! Final model saved to {save_path}")
 
+    if is_main and log_with:
+        accelerator.end_training()
     accelerator.wait_for_everyone()
 
 
@@ -644,6 +692,10 @@ def main():
         "1girl, white hair, blue eyes, school uniform, looking at viewer",
         "1boy, black hair, red eyes, dark fantasy armor, standing in rain",
     ])
+    # Wandb
+    parser.add_argument("--wandb", action="store_true", default=False)
+    parser.add_argument("--wandb_project", type=str, default="flux2-klein-finetune")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
 
     args = parser.parse_args()
     train(args)
