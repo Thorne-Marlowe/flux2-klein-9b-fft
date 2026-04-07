@@ -111,17 +111,6 @@ accelerate launch --num_processes=4 --multi_gpu \
 | Position IDs | 3D (H, W, C) | **4D (T, H, W, L)** |
 | Pipeline | FluxPipeline | **Flux2KleinPipeline** |
 
-## Citation
-
-```
-@misc{flux2-klein-finetune,
-  title={First Open-Source Full Fine-tuning for FLUX.2 Klein},
-  author={Junst},
-  year={2026},
-  url={https://github.com/Junst/flux2-klein-finetune}
-}
-```
-
 ## License
 
 Apache 2.0 (same as FLUX.2-klein-base-4B)
