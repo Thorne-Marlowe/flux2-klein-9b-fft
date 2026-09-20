@@ -26,6 +26,23 @@ BASE_9B_ARCHITECTURE = {"num_layers": 8, "num_single_layers": 24,
                         "joint_attention_dim": 12288, "in_channels": 128}
 
 
+@contextlib.contextmanager
+def stub_dependencies(modules):
+    # Restore only our stubs. Clearing newly imported torch/torchvision modules
+    # would leave their native operator registrations alive and break later tests.
+    missing = object()
+    previous = {name: sys.modules.get(name, missing) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in previous.items():
+            if module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
 class Config(dict):
     __getattr__ = dict.__getitem__
 
@@ -97,18 +114,20 @@ class StandaloneTests(unittest.TestCase):
         (self.data / "one.txt").write_text("a test image", encoding="utf-8")
 
     def args(self, *extra):
-        explicit_smoke = (["--model_path", "local-base-9b", "--target_size", "32"]
+        explicit_smoke = (["--model_path", "local-base-9b", "--target_size", "32", "--optimizer", "adamw"]
                           if "--smoke_test" in extra else [])
         return trainer.parse_args(["--data_dir", str(self.data), "--output_dir",
                                    str(self.root / "out"), *explicit_smoke, *extra])
 
     def test_smoke_requires_explicit_model_and_size_and_preserves_normal_defaults(self):
         required = ["--data_dir", str(self.data), "--output_dir", str(self.root / "out")]
-        for extra in [[], ["--model_path", "local-base-9b"], ["--target_size", "256"]]:
+        for extra in [[], ["--model_path", "local-base-9b"], ["--target_size", "256"],
+                      ["--model_path", "local-base-9b", "--target_size", "256"]]:
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 trainer.parse_args([*required, "--smoke_test", *extra])
         self.assertEqual(self.args().model_path, "black-forest-labs/FLUX.2-klein-base-4B")
         self.assertEqual(self.args().target_size, 1024)
+        self.assertEqual(self.args().optimizer, "adamw8bit")
 
     def test_ema_defaults_and_explicit_disable(self):
         self.assertTrue(self.args().use_ema)
@@ -306,12 +325,15 @@ class StandaloneTests(unittest.TestCase):
                                text_encoder=text, tokenizer=object(), vae_scale_factor=8)
 
     def run_mocked_loop(self, *, failure=None, ordinary=False, mutate_buffer=False,
-                        partial_update=False, invalid_metadata=False):
+                        partial_update=False, invalid_metadata=False, no_update=False,
+                        bad_clip=False, optimizer_name="adamw"):
         pipe = self.tiny_pipe()
+        pipe.vae.encode = Mock(wraps=pipe.vae.encode)
         pipeline = Mock()
         pipeline.load_config.return_value = BASE_CONFIG
         pipeline.from_pretrained.return_value = pipe
         pipeline._get_qwen3_prompt_embeds.return_value = torch.ones(1, 4, 6, dtype=torch.bfloat16)
+        pipe._get_qwen3_prompt_embeds = pipeline._get_qwen3_prompt_embeds
         pipeline._prepare_latent_ids.return_value = torch.zeros(1, 4, 4)
         pipeline._prepare_text_ids.return_value = torch.zeros(1, 4, 4)
         transformer_class = Mock()
@@ -325,14 +347,14 @@ class StandaloneTests(unittest.TestCase):
                                                  FlowMatchEulerDiscreteScheduler=Mock())}
         flags = (["--steps", "1", "--batch_size", "1", "--grad_accum", "1", "--no_ema",
                   "--num_workers", "0"] if ordinary else ["--smoke_test"])
-        args = self.args(*flags, "--target_size", "32", "--optimizer", "adamw",
-                         "--lr", "0.1", "--save_every", "2" if ordinary else "1",
+        args = self.args(*flags, "--target_size", "32", "--optimizer", optimizer_name,
+                         "--save_every", "2" if ordinary else "1",
                          "--sample_every", "2" if ordinary else "1")
         if ordinary:
             pipeline.load_config.side_effect = AssertionError("Ordinary training must not require optional metadata")
             pipe.transformer.save_pretrained.side_effect = None
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch.dict(sys.modules, modules))
+            stack.enter_context(stub_dependencies(modules))
             stack.enter_context(patch.dict(trainer.os.environ, {"ACCELERATE_USE_FSDP": "false",
                                                               "ACCELERATE_USE_DEEPSPEED": "false"}))
             stack.enter_context(patch.object(trainer, "preflight_smoke_runtime"))
@@ -341,6 +363,10 @@ class StandaloneTests(unittest.TestCase):
             stack.enter_context(patch.object(trainer, "preflight_9b_architecture", side_effect=lambda config:
                                             None if config is pipe.transformer.config else validate_architecture(config)))
             stack.enter_context(patch.object(torch.cuda, "reset_peak_memory_stats"))
+            stack.enter_context(patch.object(torch.cuda, "mem_get_info", return_value=(1024, 2048)))
+            stack.enter_context(patch.object(torch.cuda, "get_device_name", return_value="mock CUDA device"))
+            stack.enter_context(patch.object(torch.cuda, "synchronize"))
+            stack.enter_context(patch.object(torch.cuda, "empty_cache"))
             stack.enter_context(patch.object(torch.cuda, "max_memory_allocated", return_value=123))
             stack.enter_context(patch.object(torch.cuda, "max_memory_reserved", return_value=456))
             stack.enter_context(patch.object(trainer, "EMAModel", side_effect=AssertionError("EMA allocated")))
@@ -352,19 +378,46 @@ class StandaloneTests(unittest.TestCase):
                 stack.enter_context(patch.object(TinyAccelerator, "backward",
                                                 side_effect=torch.OutOfMemoryError("synthetic backward OOM")))
             elif failure == "optimizer_step":
-                stack.enter_context(patch.object(torch.optim.AdamW, "step",
-                                                side_effect=torch.OutOfMemoryError("synthetic optimizer OOM")))
+                original_step = torch.optim.AdamW.step
+                def step(optimizer, *args, **kwargs):
+                    if any(p is pipe.transformer.weight for g in optimizer.param_groups for p in g["params"]):
+                        raise torch.OutOfMemoryError("synthetic optimizer OOM")
+                    return original_step(optimizer, *args, **kwargs)
+                stack.enter_context(patch.object(torch.optim.AdamW, "step", step))
+            elif failure in ("vae_encoding", "text_encoding"):
+                target = pipe.vae if failure == "vae_encoding" else pipeline
+                name = "encode" if failure == "vae_encoding" else "_get_qwen3_prompt_embeds"
+                if failure == "text_encoding":
+                    pipe._get_qwen3_prompt_embeds.side_effect = torch.OutOfMemoryError("synthetic encoding OOM")
+                else:
+                    stack.enter_context(patch.object(target, name, side_effect=torch.OutOfMemoryError("synthetic encoding OOM")))
             if mutate_buffer:
                 original_encode = pipe.vae.encode
                 def encode(images):
                     pipe.vae.bn.num_batches_tracked += 1
                     return original_encode(images)
                 stack.enter_context(patch.object(pipe.vae, "encode", side_effect=encode))
-            if partial_update:
+            if partial_update or no_update:
+                original_step = torch.optim.AdamW.step
                 def update_only_bias(optimizer, *args, **kwargs):
+                    if not any(p is pipe.transformer.weight for g in optimizer.param_groups for p in g["params"]):
+                        return original_step(optimizer, *args, **kwargs)
                     with torch.no_grad():
-                        pipe.transformer.bias.add_(0.125)
+                        if not no_update:
+                            pipe.transformer.bias.add_(0.125)
                 stack.enter_context(patch.object(torch.optim.AdamW, "step", update_only_bias))
+            if bad_clip:
+                def clip(self, parameters, max_norm):
+                    for p in parameters:
+                        p.grad.fill_(float("nan"))
+                stack.enter_context(patch.object(TinyAccelerator, "clip_grad_norm_", clip))
+            if not ordinary:
+                def prepare(self, *objects):
+                    pipeline._get_qwen3_prompt_embeds.assert_called_once()
+                    trainer.require_cpu(pipe.vae, "VAE before prepare")
+                    trainer.require_cpu(pipe.text_encoder, "text encoder before prepare")
+                    return objects
+                stack.enter_context(patch.object(TinyAccelerator, "prepare", prepare))
             trainer.train(args)
         return args, pipe, pipeline, transformer_class
 
@@ -377,7 +430,17 @@ class StandaloneTests(unittest.TestCase):
         self.assertEqual(report["peak_gpu_allocated_bytes"], 123)
         self.assertEqual(report["missing_gradients"], [])
         self.assertFalse(report["ema_enabled"])
-        self.assertEqual(report["learning_rates_used"], [0.1])
+        self.assertEqual(report["learning_rates_used"], [3e-5])
+        self.assertFalse(report["optimizer"]["configuration"][0]["foreach"])
+        self.assertEqual(report["optimizer"]["configuration"][0]["weight_decay"], 0.01)
+        self.assertTrue(report["optimizer_step_completed"])
+        self.assertIn("gradients_after_clip", report)
+        self.assertGreater(report["memory_after_step"]["optimizer_state"]["total_bytes"], 0)
+        self.assertEqual(report["optimizer_details_after_step"]["states_by_parameter"]["weight"]["step"], 1)
+        self.assertEqual(report["gpu_at_start"]["capacity_bytes"], 2048)
+        self.assertEqual(report["seed"], 0)
+        pipe.vae.encode.assert_called_once()
+        pipeline._get_qwen3_prompt_embeds.assert_called_once()
         self.assertIn("torch.bfloat16", report["optimizer_state_dtypes"])
         self.assertTrue(report["frozen_components"]["vae"]["unchanged_under_checks"])
         self.assertGreater(report["frozen_components"]["vae"]["buffer_tensors_checked"], 0)
@@ -405,6 +468,7 @@ class StandaloneTests(unittest.TestCase):
         report.stage = "backward"
         with patch.object(torch.cuda, "max_memory_allocated", side_effect=[500, 200]), \
                 patch.object(torch.cuda, "max_memory_reserved", side_effect=[700, 400]), \
+                patch.object(torch.cuda, "mem_get_info", return_value=(1024, 2048)), \
                 patch.object(torch.cuda, "reset_peak_memory_stats") as reset:
             report.start_stage("optimizer_step")
             report.write()
@@ -414,7 +478,7 @@ class StandaloneTests(unittest.TestCase):
         self.assertEqual(report.data["stage_memory"]["optimizer_step"]["peak_allocated_bytes"], 200)
 
     def test_mocked_oom_reports_stage_and_memory_and_reraises(self):
-        for stage in ["model_loading", "backward", "optimizer_step"]:
+        for stage in ["model_loading", "vae_encoding", "text_encoding", "backward", "optimizer_step"]:
             with self.subTest(stage=stage), self.assertRaises(torch.OutOfMemoryError):
                 self.run_mocked_loop(failure=stage)
             report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
@@ -429,7 +493,7 @@ class StandaloneTests(unittest.TestCase):
             self.run_mocked_loop(mutate_buffer=True)
         report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
         self.assertFalse(report["passed"])
-        self.assertEqual(report["frozen_components"]["vae"]["changed_buffers"], ["bn.num_batches_tracked"])
+        self.assertEqual(report["frozen_encoding_checks"]["vae"]["changed_buffers"], ["bn.num_batches_tracked"])
 
     def test_mocked_smoke_does_not_require_every_tensor_to_change(self):
         self.run_mocked_loop(partial_update=True)
@@ -443,6 +507,105 @@ class StandaloneTests(unittest.TestCase):
         pipeline.load_config.assert_not_called()
         transformer_class.load_config.assert_not_called()
         pipe.transformer.save_pretrained.assert_called_once()
+
+    def test_staged_encoding_moves_pipeline_components_sequentially(self):
+        pipe = self.tiny_pipe()
+        pipe.vae.requires_grad_(False).eval()
+        pipe.text_encoder.requires_grad_(False).eval()
+        events = []
+        latents = torch.ones(1, 1, 4, 4, dtype=torch.bfloat16)
+        embeds = torch.ones(1, 4, 6, dtype=torch.bfloat16)
+        def encode(*args, **kwargs):
+            events.append("encode image")
+            return latents
+        def prompt(**kwargs):
+            events.append("encode caption")
+            return embeds
+        pipe._get_qwen3_prompt_embeds = Mock(side_effect=prompt)
+        smoke = Mock()
+        smoke.data = {}
+        with patch.object(pipe.transformer, "to", side_effect=AssertionError("transformer moved during encoding")), \
+                patch.object(pipe.vae, "to", side_effect=lambda device, **kwargs: events.append(f"vae {device}") or pipe.vae), \
+                patch.object(pipe.text_encoder, "to", side_effect=lambda device, **kwargs: events.append(f"text {device}") or pipe.text_encoder), \
+                patch.object(trainer, "encode_images_klein", side_effect=encode) as image_encoder, \
+                patch.object(torch.cuda, "empty_cache"):
+            result = trainer.stage_smoke_encoding(pipe, trainer.ImageTextDataset(self.data, fixed_size=True, target_size=32),
+                                                 torch.device("cuda"), torch.bfloat16, smoke)
+        self.assertEqual(events, ["vae cuda", "encode image", "vae cpu", "text cuda", "encode caption", "text cpu"])
+        self.assertIs(result[0], latents)
+        self.assertIs(result[1], embeds)
+        image_encoder.assert_called_once()
+        pipe._get_qwen3_prompt_embeds.assert_called_once()
+        self.assertTrue(all(c["unchanged_under_checks"] for c in smoke.data["frozen_encoding_checks"].values()))
+
+    def test_tensor_and_training_memory_match_tensor_bytes(self):
+        a = torch.zeros(3, dtype=torch.bfloat16)
+        b = torch.zeros(2, dtype=torch.float32)
+        report = trainer.tensor_memory([a, b, a, None])
+        self.assertEqual(report["total_bytes"], 14)
+        self.assertEqual(report["by_device_dtype"]["cpu/torch.bfloat16"]["bytes"], 6)
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
+        model(torch.ones(1, 2)).sum().backward()
+        self.assertEqual(trainer.training_memory(model, optimizer)["optimizer_state"]["total_bytes"], 0)
+        optimizer.step()
+        report = trainer.training_memory(model, optimizer)
+        self.assertEqual(report["parameters"]["total_bytes"], 12)
+        self.assertEqual(report["gradients"]["total_bytes"], 12)
+        self.assertEqual(report["optimizer_state"]["total_bytes"], 32)
+        self.assertEqual(report["total_bytes"], 56)
+        details = trainer.optimizer_details(model, optimizer)
+        self.assertEqual(details["states_by_parameter"]["weight"]["step"], 1)
+        self.assertEqual(details["states_by_parameter"]["weight"]["keys"], ["exp_avg", "exp_avg_sq", "step"])
+
+    def test_default_lr_precision_probe_detects_rounding_without_mutation(self):
+        samples = {"weight": torch.tensor([0.001, 0.01, 1.])}
+        before = samples["weight"].clone()
+        probe = trainer.precision_probe(samples, 3e-5, 0.01)
+        self.assertEqual(len(probe["results"]), 1)
+        result = probe["results"][0]
+        self.assertEqual(result["lr"], 3e-5)
+        self.assertGreater(result["lost_on_bf16_storage_cast"], 0)
+        self.assertGreater(result["unchanged_in_bf16_optimizer"], 0)
+        self.assertGreater(result["fp32_updates"], result["lost_on_bf16_storage_cast"])
+        torch.testing.assert_close(samples["weight"], before)
+        self.assertEqual([r["lr"] for r in trainer.precision_probe(samples, 1e-5, 0.0)["results"]], [3e-5, 1e-5])
+
+    def test_completed_step_is_separate_from_stored_weight_changes(self):
+        self.run_mocked_loop(no_update=True)
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertTrue(report["optimizer_step_completed"])
+        self.assertEqual(report["optimizer_steps"], 1)
+        self.assertFalse(report["stored_weight_changes_observed"])
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["learning_rates_used"], [3e-5])
+
+    def test_bad_post_clip_gradients_fail_before_optimizer_step(self):
+        with self.assertRaisesRegex(RuntimeError, "after clipping"):
+            self.run_mocked_loop(bad_clip=True)
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["optimizer_steps"], 0)
+        self.assertEqual(report["gradients_before_clip"]["nonfinite_gradients"], [])
+        self.assertTrue(report["gradients_after_clip"]["nonfinite_gradients"])
+
+    def test_smoke_adafactor_reports_effective_configuration(self):
+        try:
+            from transformers.optimization import Adafactor
+        except ImportError:
+            self.skipTest("Transformers Adafactor not installed")
+        self.run_mocked_loop(optimizer_name="adafactor")
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertEqual(report["optimizer"]["configuration"][0]["weight_decay"], 0.01)
+        self.assertFalse(report["optimizer"]["configuration"][0]["relative_step"])
+        self.assertEqual(report["optimizer_details_after_step"]["states_by_parameter"]["weight"]["step"], 1)
+        self.assertIn("exp_avg_sq_row", report["optimizer_details_after_step"]["states_by_parameter"]["weight"]["keys"])
+
+    def test_missing_dependency_versions_are_explicit(self):
+        with patch.object(trainer.importlib.metadata, "version", side_effect=trainer.importlib.metadata.PackageNotFoundError):
+            versions = trainer.dependency_versions()
+        self.assertIsNone(versions["diffusers"])
+        self.assertEqual(versions["torch"], torch.__version__)
 
 
 if __name__ == "__main__":

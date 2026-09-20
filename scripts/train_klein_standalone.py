@@ -34,6 +34,7 @@ Usage:
 """
 
 import argparse
+import importlib.metadata
 import json
 import math
 import os
@@ -399,6 +400,136 @@ def optimizer_state_dtypes(optimizer):
     return counts
 
 
+def tensor_memory(tensors):
+    """Logical tensor bytes, deduplicated by tensor identity (not allocator storage)."""
+    groups, seen = {}, set()
+    for tensor in tensors:
+        if tensor is None or id(tensor) in seen:
+            continue
+        seen.add(id(tensor))
+        key = f"{tensor.device}/{tensor.dtype}"
+        entry = groups.setdefault(key, {"device": str(tensor.device), "dtype": str(tensor.dtype),
+                                        "tensors": 0, "bytes": 0})
+        entry["tensors"] += 1
+        entry["bytes"] += tensor.numel() * tensor.element_size()
+    return {"by_device_dtype": groups, "total_bytes": sum(e["bytes"] for e in groups.values()),
+            "scope": "logical tensor bytes; distinct views can share storage"}
+
+
+def state_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from state_tensors(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from state_tensors(item)
+
+
+def training_memory(model, optimizer):
+    result = {"parameters": tensor_memory(model.parameters()),
+              "gradients": tensor_memory(p.grad for p in model.parameters()),
+              "optimizer_state": tensor_memory(state_tensors(optimizer.state))}
+    result["total_bytes"] = sum(item["total_bytes"] for item in result.values())
+    return result
+
+
+def optimizer_details(model, optimizer):
+    groups = [{key: value for key, value in group.items()
+               if key != "params" and isinstance(value, (str, int, float, bool, tuple, list, type(None)))}
+              for group in optimizer.param_groups]
+    states = {}
+    for name, p in model.named_parameters():
+        state = optimizer.state.get(p, {})
+        step = state.get("step")
+        if isinstance(step, torch.Tensor):
+            step = step.item() if step.numel() == 1 else None
+        states[name] = {"keys": sorted(str(key) for key in state), "step": step,
+                        "memory": tensor_memory(state_tensors(state))}
+    return {"param_groups": groups, "states_by_parameter": states}
+
+
+def dependency_versions():
+    versions = {"torch": torch.__version__, "cuda_runtime": torch.version.cuda}
+    for name in ("diffusers", "accelerate", "transformers", "bitsandbytes", "safetensors", "torchvision"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def precision_probe(samples, lr, weight_decay):
+    """Tiny CPU AdamW/unit-gradient control, NOT a prediction of the selected optimizer."""
+    values = [torch.tensor([0., 0.001, 0.01, 0.1, 1., -0.001, -0.01, -0.1, -1.], device="cpu")]
+    names = list(samples)
+    # Bound size independently of the number of transformer tensors.
+    for index in torch.linspace(0, max(len(names) - 1, 0), min(len(names), 16), device="cpu").long().tolist():
+        values.append(samples[names[index]][:8])
+    initial = torch.cat(values).to(torch.bfloat16)
+    results = []
+    for rate in dict.fromkeys((3e-5, lr)):
+        parameters = [torch.nn.Parameter(initial.clone()), torch.nn.Parameter(initial.float())]
+        for p in parameters:
+            optimizer = torch.optim.AdamW([p], lr=rate, weight_decay=weight_decay, foreach=False)
+            p.grad = torch.ones_like(p)
+            optimizer.step()
+        reference_delta = parameters[1].detach() - initial.float()
+        stored_delta = parameters[0].detach().float() - initial.float()
+        rounded_reference = parameters[1].detach().to(torch.bfloat16)
+        results.append({"lr": rate, "weight_decay": weight_decay, "values": initial.float().tolist(),
+                        "fp32_deltas": reference_delta.tolist(), "bf16_deltas": stored_delta.tolist(),
+                        "fp32_updates": int(torch.count_nonzero(reference_delta)),
+                        "lost_on_bf16_storage_cast": int(torch.count_nonzero((reference_delta != 0) & (rounded_reference == initial))),
+                        "unchanged_in_bf16_optimizer": int(torch.count_nonzero((reference_delta != 0) & (stored_delta == 0)))})
+    return {"scope": "CPU AdamW unit-gradient control using magnitude anchors and bounded model samples; not actual training gradients or an 8-bit/Adafactor reference",
+            "default_lr": 3e-5, "results": results}
+
+
+def require_cpu(model, name):
+    if any(t.device.type != "cpu" for t in list(model.parameters()) + list(model.buffers())):
+        raise ValueError(f"Smoke staging requires {name} on CPU")
+
+
+@torch.no_grad()
+def stage_smoke_encoding(pipe, dataset, device, dtype, smoke):
+    """Encode once; move the SAME pipeline modules back to CPU before training."""
+    require_cpu(pipe.transformer, "transformer")
+    require_cpu(pipe.vae, "VAE")
+    require_cpu(pipe.text_encoder, "text encoder")
+    batch = collate_fn([dataset[0]])
+    checks = {}
+    smoke.start_stage("vae_encoding")
+    pipe.vae.to(device, dtype=dtype)
+    before = frozen_snapshot(pipe.vae)
+    latents = encode_images_klein(pipe.vae, batch["pixel_values"], device, dtype)
+    checks["vae"] = frozen_diagnostics(pipe.vae, before)
+    pipe.vae.to("cpu")
+    require_cpu(pipe.vae, "VAE after encoding")
+    # Record the encoding peak before releasing unused allocator blocks.
+    smoke.start_stage("text_encoding")
+    torch.cuda.empty_cache()
+    pipe.text_encoder.to(device, dtype=dtype)
+    before = frozen_snapshot(pipe.text_encoder)
+    embeds = pipe._get_qwen3_prompt_embeds(
+        text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer, prompt=batch["captions"],
+        device=device, max_sequence_length=256, hidden_states_layers=(9, 18, 27))
+    checks["text_encoder"] = frozen_diagnostics(pipe.text_encoder, before)
+    pipe.text_encoder.to("cpu")
+    require_cpu(pipe.text_encoder, "text encoder after encoding")
+    require_cpu(pipe.transformer, "transformer after encoding")
+    smoke.data["frozen_encoding_checks"] = checks
+    smoke.data["pixel_shape"] = list(batch["pixel_values"].shape)
+    smoke.data["retained_conditioning_memory"] = tensor_memory([latents, embeds])
+    smoke.start_stage("frozen_offloaded")
+    torch.cuda.empty_cache()
+    if not all(check["unchanged_under_checks"] for check in checks.values()):
+        smoke.write()
+        raise RuntimeError("Smoke test failed: frozen component changed during encoding")
+    return latents, embeds
+
+
 def frozen_snapshot(model):
     if any(p.requires_grad or p.grad is not None for p in model.parameters()) or model.training:
         raise ValueError("Frozen component must be in eval mode without trainable parameters or gradients")
@@ -433,7 +564,9 @@ class SmokeReport:
         self.device = None
         self.stage = "initialization"
         self.data = {"model": args.model_path, "target_size": args.target_size,
-                     "passed": False, "optimizer_steps": 0, "stage_memory": {},
+                     "seed": args.seed, "dependency_versions": dependency_versions(),
+                     "passed": False, "optimizer_steps": 0, "optimizer_step_completed": False,
+                     "stored_weight_changes_observed": None, "stage_memory": {},
                      "memory_scope": "PyTorch CUDA allocator absolute peaks per stage, not allocation deltas"}
 
     def measure(self):
@@ -441,6 +574,14 @@ class SmokeReport:
             return
         memory = {"peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
                   "peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device)}
+        # Device-wide usage includes other processes and non-PyTorch allocations;
+        # it is an instantaneous boundary observation, NOT a measured device peak.
+        try:
+            free, total = torch.cuda.mem_get_info(self.device)
+            memory["device_memory_at_boundary"] = {"free_bytes": free, "total_bytes": total,
+                                                    "used_bytes": total - free}
+        except RuntimeError as error:
+            memory["device_memory_query_error"] = str(error)
         self.data["stage_memory"][self.stage] = memory
         for key in ("allocated", "reserved"):
             self.data[f"peak_gpu_{key}_bytes"] = max(
@@ -564,6 +705,11 @@ def train(args):
 
 
 def _train(args, smoke):
+    if smoke is not None:
+        if args.optimizer is None:
+            raise ValueError("Smoke test requires an explicit --optimizer")
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
     dataset = preflight_dataset(args)
     if smoke is not None:
         for variable in ("ACCELERATE_USE_FSDP", "ACCELERATE_USE_DEEPSPEED"):
@@ -593,6 +739,9 @@ def _train(args, smoke):
     if args.smoke_test:
         preflight_smoke_runtime(accelerator)
         smoke.device = device
+        smoke.data["gpu_name"] = torch.cuda.get_device_name(device)
+        free, total = torch.cuda.mem_get_info(device)
+        smoke.data["gpu_at_start"] = {"capacity_bytes": total, "available_bytes": free}
         torch.cuda.reset_peak_memory_stats(device)
         smoke.start_stage("model_loading")
 
@@ -634,9 +783,18 @@ def _train(args, smoke):
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
-    # Move frozen models to local device
-    vae.to(device, dtype=dtype)
-    text_encoder.to(device, dtype=dtype)
+    if smoke is not None:
+        encoded_latents, encoded_embeds = stage_smoke_encoding(pipe, dataset, device, dtype, smoke)
+        # A fresh CPU baseline follows the checked encoding/transfer stage. No GPU weight copies.
+        frozen_before = {"vae": frozen_snapshot(vae), "text_encoder": frozen_snapshot(text_encoder)}
+        smoke.data["frozen_cpu_memory"] = {
+            name: {"parameters": tensor_memory(model.parameters()), "buffers": tensor_memory(model.buffers())}
+            for name, model in (("vae", vae), ("text_encoder", text_encoder))}
+        smoke.start_stage("device_placement_and_optimizer_setup")
+    else:
+        # Preserve ordinary training's residency and encoding behavior.
+        vae.to(device, dtype=dtype)
+        text_encoder.to(device, dtype=dtype)
 
     # Optimizer
     if args.optimizer == "adamw8bit":
@@ -652,11 +810,17 @@ def _train(args, smoke):
             relative_step=False,
             scale_parameter=False,
             warmup_init=False,
+            **({"weight_decay": args.weight_decay} if args.smoke_test else {}),
         )
     else:
         optimizer = torch.optim.AdamW(
-            transformer.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            transformer.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+            **({"foreach": False} if args.smoke_test else {}),
         )
+    if smoke is not None:
+        smoke.data["optimizer"] = {"name": args.optimizer, "class": type(optimizer).__name__,
+                                   "configuration": optimizer_details(transformer, optimizer)["param_groups"]}
+        smoke.data["memory_before_prepare"] = training_memory(transformer, optimizer)
 
     coverage = parameter_coverage(transformer, optimizer)
     if is_main:
@@ -688,8 +852,9 @@ def _train(args, smoke):
         raise ValueError("Prepared dataloader has no batches")
     if smoke is not None:
         smoke.data["coverage"] = coverage
-        smoke.start_stage("frozen_baseline")
-        frozen_before = {"vae": frozen_snapshot(vae), "text_encoder": frozen_snapshot(text_encoder)}
+        require_cpu(pipe.vae, "pipeline VAE before training")
+        require_cpu(pipe.text_encoder, "pipeline text encoder before training")
+        smoke.data["memory_after_prepare"] = training_memory(accelerator.unwrap_model(transformer), optimizer)
 
     # EMA (only on main process to save memory on other GPUs)
     ema = None
@@ -773,24 +938,25 @@ def _train(args, smoke):
                 break
 
             with accelerator.accumulate(transformer):
-                if smoke is not None:
-                    smoke.start_stage("encoding")
                 # Encode images (VAE is per-GPU, no communication needed)
-                if "latents" in batch:
+                if smoke is not None:
+                    latents, prompt_embeds = encoded_latents, encoded_embeds
+                elif "latents" in batch:
                     latents = batch["latents"].to(device, dtype=dtype)
                 else:
                     latents = encode_images_klein(vae, batch["pixel_values"], device, dtype)
 
                 # Encode text (text encoder is per-GPU)
-                with torch.no_grad():
-                    prompt_embeds = get_qwen3_embeds(
-                        text_encoder=text_encoder,
-                        tokenizer=tokenizer,
-                        prompt=batch["captions"],
-                        device=device,
-                        max_sequence_length=256,
-                        hidden_states_layers=(9, 18, 27),
-                    )
+                if smoke is None:
+                    with torch.no_grad():
+                        prompt_embeds = get_qwen3_embeds(
+                            text_encoder=text_encoder,
+                            tokenizer=tokenizer,
+                            prompt=batch["captions"],
+                            device=device,
+                            max_sequence_length=256,
+                            hidden_states_layers=(9, 18, 27),
+                        )
 
                 # Flow matching: sample timestep and noise
                 if smoke is not None:
@@ -846,8 +1012,13 @@ def _train(args, smoke):
                     unwrapped = accelerator.unwrap_model(transformer)
                     diagnostics = smoke.data
                     diagnostics.update(ema_enabled=ema is not None,
-                                       pixel_shape=list(batch["pixel_values"].shape),
                                        **gradient_diagnostics(unwrapped))
+                    diagnostics["gradients_before_clip"] = {
+                        **{key: value for key, value in diagnostics.items() if key in (
+                            "missing_gradients", "nonfinite_gradients", "gradient_parameter_tensors",
+                            "nonzero_gradient_parameter_tensors", "gradient_details")},
+                        "l2_norm": diagnostics["gradient_l2_norm_before_clip"]}
+                    diagnostics["memory_after_backward"] = training_memory(unwrapped, optimizer)
                     if (diagnostics["missing_gradients"] or diagnostics["nonfinite_gradients"]
                             or diagnostics["gradient_l2_norm_before_clip"] == 0):
                         diagnostics.update(passed=False, optimizer_steps=0)
@@ -855,25 +1026,42 @@ def _train(args, smoke):
                         raise RuntimeError(f"Smoke test gradient failure: {diagnostics}")
                     before = parameter_probes(unwrapped)
                     diagnostics["learning_rates_used"] = [float(group["lr"]) for group in optimizer.param_groups]
-                    smoke.start_stage("optimizer_step")
+                    diagnostics["max_grad_norm"] = args.max_grad_norm
+                    diagnostics["precision_probe"] = precision_probe(before, args.lr, optimizer.param_groups[0].get("weight_decay", 0.0))
+                    smoke.start_stage("gradient_clipping")
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
+                if smoke is not None:
+                    after_clip = gradient_diagnostics(unwrapped)
+                    after_clip["l2_norm"] = after_clip.pop("gradient_l2_norm_before_clip")
+                    diagnostics["gradients_after_clip"] = after_clip
+                    if (after_clip["missing_gradients"] or after_clip["nonfinite_gradients"]
+                            or after_clip["nonzero_gradient_parameter_tensors"] == 0):
+                        diagnostics.update(passed=False, error="invalid gradients after clipping")
+                        smoke.write()
+                        raise RuntimeError("Smoke test gradient failure after clipping")
+                    smoke.start_stage("optimizer_step")
                 optimizer.step()
                 if args.smoke_test:
+                    torch.cuda.synchronize(device)
                     diagnostics["optimizer_step_skipped"] = accelerator.optimizer_step_was_skipped
                     diagnostics["optimizer_steps"] = int(not accelerator.optimizer_step_was_skipped)
+                    diagnostics["optimizer_step_completed"] = not accelerator.optimizer_step_was_skipped
                     smoke.start_stage("post_step_diagnostics")
                     diagnostics["optimizer_state_dtypes"] = optimizer_state_dtypes(optimizer)
+                    diagnostics["optimizer_details_after_step"] = optimizer_details(unwrapped, optimizer)
+                    diagnostics["memory_after_step"] = training_memory(unwrapped, optimizer)
                     diagnostics.update(parameter_change_diagnostics(before, parameter_probes(unwrapped)))
+                    diagnostics["stored_weight_changes_observed"] = diagnostics["changed_sampled_values"] > 0
                     diagnostics["frozen_components"] = {
                         "vae": frozen_diagnostics(vae, frozen_before["vae"]),
                         "text_encoder": frozen_diagnostics(text_encoder, frozen_before["text_encoder"])}
                     diagnostics["passed"] = bool(
                         diagnostics["optimizer_steps"] == 1
                         and diagnostics["sampled_parameters_finite"]
-                        and diagnostics["changed_sampled_values"] > 0
                         and all(d["unchanged_under_checks"] for d in diagnostics["frozen_components"].values())
                     )
+                    diagnostics["passed_scope"] = "completed finite one-step execution and frozen checks; stored-weight changes reported separately, not a training-quality certification"
                     smoke.write()
                     if not diagnostics["passed"]:
                         raise RuntimeError("Smoke test failed: optimizer skipped, invalid updates, or frozen component changed; see report")
@@ -1013,7 +1201,7 @@ def parse_args(argv=None):
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--target_size", type=int, default=None)
     parser.add_argument("--use_cached_latents", action="store_true")
-    parser.add_argument("--smoke_test", action="store_true", help="Offline Base 9B single-GPU, one-step run; requires explicit --model_path and --target_size (e.g. 256); disables EMA, caching, resume, samples and checkpoints")
+    parser.add_argument("--smoke_test", action="store_true", help="Offline Base 9B single-GPU, one-step run with staged frozen encoding; requires explicit --model_path, --target_size (e.g. 256), and --optimizer; disables EMA, caching, resume, samples and checkpoints")
     # Training
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=2)
@@ -1021,7 +1209,8 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--optimizer", type=str, default="adamw8bit", choices=["adamw", "adamw8bit", "adafactor"])
+    parser.add_argument("--optimizer", type=str, default=None, choices=["adamw", "adamw8bit", "adafactor"], help="Required explicitly for smoke tests; ordinary training defaults to adamw8bit")
+    parser.add_argument("--seed", type=int, default=0, help="Smoke-test random seed (ordinary training unchanged)")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -1046,13 +1235,15 @@ def parse_args(argv=None):
 
     args = parser.parse_args(argv)
     if args.smoke_test:
-        if args.model_path is None or args.target_size is None:
-            parser.error("--smoke_test requires explicit --model_path (Klein Base 9B) and --target_size (e.g. 256)")
+        if args.model_path is None or args.target_size is None or args.optimizer is None:
+            parser.error("--smoke_test requires explicit --model_path (Klein Base 9B), --target_size (e.g. 256), and --optimizer")
     else:
         if args.model_path is None:
             args.model_path = "black-forest-labs/FLUX.2-klein-base-4B"
         if args.target_size is None:
             args.target_size = 1024
+        if args.optimizer is None:
+            args.optimizer = "adamw8bit"
     return args
 
 
