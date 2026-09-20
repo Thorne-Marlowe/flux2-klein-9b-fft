@@ -6,6 +6,13 @@ Supports gradient checkpointing, AdamW8bit, resolution bucketing,
 EMA, sample generation, and Multi-GPU DDP training.
 
 Usage:
+  # One-step preparation path; model must already be available locally/cached.
+  # Writes smoke_diagnostics.json, skips samples and model checkpoints.
+  python scripts/train_klein_standalone.py --smoke_test \
+    --model_path /path/to/FLUX.2-klein-base-9B \
+    --data_dir /path/to/one-pair --output_dir /path/to/smoke \
+    --target_size 256 --optimizer adamw
+
   # Single GPU
   python scripts/train_klein_standalone.py \
     --model_path black-forest-labs/FLUX.2-klein-base-4B \
@@ -36,14 +43,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from accelerate import Accelerator
-from diffusers import (
-    FlowMatchEulerDiscreteScheduler,
-    Flux2KleinPipeline,
-    Flux2Transformer2DModel,
-)
 from PIL import Image
-from safetensors.torch import load_file
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -67,10 +67,12 @@ def find_bucket(w, h):
 class ImageTextDataset(Dataset):
     """Simple dataset: images + .txt captions, with optional pre-cached latents."""
 
-    def __init__(self, data_dir, target_size=1024, use_cached_latents=False):
+    def __init__(self, data_dir, target_size=1024, use_cached_latents=False,
+                 fixed_size=False):
         self.data_dir = Path(data_dir)
         self.target_size = target_size
         self.use_cached = use_cached_latents
+        self.fixed_size = fixed_size
         self.cache_dir = self.data_dir / "_latent_cache"
 
         exts = {".jpg", ".jpeg", ".png", ".webp"}
@@ -102,9 +104,10 @@ class ImageTextDataset(Dataset):
                 return {"latent": cached, "caption": caption, "path": img_path}
 
         # Load and preprocess image
-        img = Image.open(img_path).convert("RGB")
+        with Image.open(img_path) as source:
+            img = source.convert("RGB")
         w, h = img.size
-        tw, th = find_bucket(w, h)
+        tw, th = (self.target_size, self.target_size) if self.fixed_size else find_bucket(w, h)
 
         scale = max(tw / w, th / h)
         nw, nh = int(w * scale), int(h * scale)
@@ -120,6 +123,8 @@ class ImageTextDataset(Dataset):
         return {"pixel_values": pixel_values, "caption": caption, "path": img_path}
 
     def _find_cached_latent(self, img_path):
+        from safetensors.torch import load_file
+
         if not self.cache_dir.exists():
             return None
         stem = Path(img_path).stem
@@ -210,6 +215,250 @@ def encode_images_klein(vae, images, device, dtype):
 # ---------------------------------------------------------------------------
 # Training Helpers
 # ---------------------------------------------------------------------------
+
+
+def preflight_dataset(args):
+    if args.smoke_test:
+        if not args.model_path or args.target_size is None:
+            raise ValueError("Smoke test requires explicit --model_path and --target_size")
+        if args.use_cached_latents or args.resume_from:
+            raise ValueError("Smoke test requires uncached data and no resume checkpoint")
+        args.batch_size = args.grad_accum = args.steps = 1
+        args.num_workers = 0
+        args.use_ema = False
+    for name in ("batch_size", "grad_accum", "steps", "target_size",
+                 "save_every", "sample_every", "log_every"):
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} must be positive")
+    if args.target_size % 16:
+        raise ValueError("target_size must be divisible by 16 for VAE patchification")
+    if not Path(args.data_dir).is_dir():
+        raise ValueError(f"Dataset directory does not exist: {args.data_dir}")
+    dataset = ImageTextDataset(
+        args.data_dir, target_size=args.target_size,
+        use_cached_latents=args.use_cached_latents, fixed_size=args.smoke_test,
+    )
+    if len(dataset) < args.batch_size:
+        raise ValueError("Dataset cannot produce a full batch; check image-caption pairs")
+    if args.smoke_test:
+        if len(dataset) != 1:
+            raise ValueError("Smoke test requires exactly one image-caption pair")
+        sample = dataset[0]  # Decode before allocating model weights.
+        if not sample["caption"]:
+            raise ValueError("Smoke test caption must not be empty")
+        if not torch.isfinite(sample["pixel_values"]).all():
+            raise ValueError("Dataset contains non-finite pixels")
+    return dataset
+
+
+def preflight_model_config(config):
+    if config.get("_class_name") != "Flux2KleinPipeline":
+        raise ValueError("Selected model must be a Flux2KleinPipeline")
+    if config.get("is_distilled") is not False:
+        raise ValueError("Selected model must explicitly declare is_distilled=false (Klein Base)")
+    transformer_entry = config.get("transformer")
+    if (not isinstance(transformer_entry, (list, tuple)) or len(transformer_entry) != 2
+            or transformer_entry[-1] != "Flux2Transformer2DModel"):
+        raise ValueError("Selected model must use Flux2Transformer2DModel")
+
+
+def preflight_9b_architecture(config):
+    # BFL Klein9BParams, expressed using Diffusers config names:
+    # https://github.com/black-forest-labs/flux2/blob/main/src/flux2/model.py
+    expected = {"num_layers": 8, "num_single_layers": 24, "num_attention_heads": 32,
+                "attention_head_dim": 128, "joint_attention_dim": 12288, "in_channels": 128}
+    for key, value in expected.items():
+        if config.get(key) != value:
+            raise ValueError(f"Smoke test requires Klein Base 9B: {key} must be {value}, got {config.get(key)!r}")
+    optional = {"out_channels": 128, "patch_size": 1, "guidance_embeds": False,
+                "mlp_ratio": 3.0, "axes_dims_rope": [32, 32, 32, 32]}
+    for key, value in optional.items():
+        actual = config.get(key)
+        if key == "out_channels" and actual is None:
+            continue  # Diffusers defaults output channels to input channels.
+        if key == "axes_dims_rope" and actual is not None:
+            actual = list(actual)
+        if key in config and actual != value:
+            raise ValueError(f"Incompatible Base 9B metadata: {key}={actual!r}")
+
+
+def preflight_components(pipe, target_size):
+    config = pipe.transformer.config
+    if config.in_channels != pipe.vae.config.latent_channels * 4:
+        raise ValueError("Transformer input channels do not match patched VAE latents")
+    if config.joint_attention_dim != pipe.text_encoder.config.hidden_size * 3:
+        raise ValueError("Transformer text width does not match the three Qwen hidden states")
+    if pipe.text_encoder.config.num_hidden_layers < 27:
+        raise ValueError("Text encoder does not provide hidden state layer 27")
+    if getattr(config, "guidance_embeds", False):
+        raise ValueError("This trainer expects Klein without guidance embeddings")
+    if target_size % (pipe.vae_scale_factor * 2):
+        raise ValueError("target_size is incompatible with this VAE's patch size")
+
+
+def preflight_smoke_runtime(accelerator):
+    mode = getattr(accelerator.distributed_type, "value", accelerator.distributed_type)
+    state = accelerator.state
+    if (mode != "NO" or getattr(state, "deepspeed_plugin", None) is not None
+            or getattr(state, "fsdp_plugin", None) is not None):
+        raise ValueError(f"Smoke test rejects distributed execution modes, including FSDP/DeepSpeed: {mode}")
+    if accelerator.num_processes != 1 or accelerator.device.type != "cuda":
+        raise ValueError("Smoke test requires a single CUDA GPU")
+    if not torch.cuda.is_bf16_supported():
+        raise ValueError("This trainer requires BF16 support")
+
+
+def parameter_coverage(model, optimizer):
+    named = dict(model.named_parameters())
+    expected = {id(p) for p in named.values()}
+    actual = [id(p) for group in optimizer.param_groups for p in group["params"]]
+    actual_ids = set(actual)
+    groups = {id(p): i for i, group in enumerate(optimizer.param_groups) for p in group["params"]}
+    frozen = [name for name, p in named.items() if not p.requires_grad]
+    missing = [name for name, p in named.items() if id(p) not in actual_ids]
+    if not expected or frozen or missing or actual_ids != expected or len(actual) != len(actual_ids):
+        raise ValueError(f"Invalid optimizer coverage: frozen={frozen}, missing={missing}, "
+                         f"extra={len(set(actual) - expected)}, duplicates={len(actual) - len(set(actual))}")
+    return {"parameter_tensors": len(named), "total_parameters": sum(p.numel() for p in named.values()),
+            "trainable_parameters": sum(p.numel() for p in named.values()),
+            "optimizer_parameter_tensors": len(actual),
+            "optimizer_membership": {name: groups[id(p)] for name, p in named.items()}}
+
+
+@torch.no_grad()
+def gradient_diagnostics(model):
+    missing, nonfinite = [], []
+    squared_norm = 0.0
+    per_parameter = {}
+    for name, p in model.named_parameters():
+        entry = {"present": p.grad is not None, "finite": None,
+                 "nonzero_values": 0, "numel": p.numel()}
+        per_parameter[name] = entry
+        if p.grad is None:
+            missing.append(name)
+            continue
+        # Bound temporary diagnostic allocations even for the largest weight matrices.
+        entry["finite"] = True
+        for chunk in p.grad.detach().reshape(-1).split(1_000_000):
+            value = chunk.float()
+            finite = torch.isfinite(value)
+            entry["nonzero_values"] += torch.count_nonzero(finite & (value != 0)).item()
+            if not finite.all().item():
+                entry["finite"] = False
+            else:
+                squared_norm += value.double().square().sum().item()
+        if not entry["finite"]:
+            nonfinite.append(name)
+    return {"missing_gradients": missing, "nonfinite_gradients": nonfinite,
+            "gradient_l2_norm_before_clip": math.sqrt(squared_norm) if not nonfinite else None,
+            "gradient_parameter_tensors": len(per_parameter) - len(missing),
+            "nonzero_gradient_parameter_tensors": sum(e["nonzero_values"] > 0 for e in per_parameter.values()),
+            "gradient_details": per_parameter}
+
+
+@torch.no_grad()
+def parameter_probes(model):
+    # Small, evenly spaced samples from EVERY tensor; never clone the 9B model.
+    probes = {}
+    for name, p in model.named_parameters():
+        count = min(256, p.numel())
+        # Integer arithmetic avoids rounded, out-of-bounds indices on huge tensors.
+        indices = torch.arange(count, device=p.device) * (p.numel() - 1) // max(count - 1, 1)
+        probes[name] = p.detach().reshape(-1)[indices].float().cpu().clone()
+    return probes
+
+
+def parameter_change_diagnostics(before, after):
+    deltas = {name: (after[name] - value).abs() for name, value in before.items()}
+    return {"parameter_change_scope": "up to 256 evenly spaced values per parameter tensor",
+            "sampled_values": sum(d.numel() for d in deltas.values()),
+            "changed_sampled_values": sum(torch.count_nonzero(d).item() for d in deltas.values()),
+            "changed_parameter_tensors_in_sample": sum(bool(torch.count_nonzero(d)) for d in deltas.values()),
+            "max_sampled_parameter_delta": max((d.max().item() for d in deltas.values() if d.numel()), default=0.0),
+            "sampled_parameters_finite": all(torch.isfinite(v).all().item() for v in after.values()),
+            "parameter_change_details": {
+                name: {"sampled_values": d.numel(), "changed_values": torch.count_nonzero(d).item(),
+                       "max_abs_delta": d.max().item() if d.numel() else 0.0}
+                for name, d in deltas.items()}}
+
+
+def optimizer_state_dtypes(optimizer):
+    """Inspect metadata only, without copying or materializing optimizer state."""
+    counts = {}
+    def visit(value):
+        if isinstance(value, torch.Tensor):
+            key = str(value.dtype)
+            counts[key] = counts.get(key, 0) + 1
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                visit(item)
+    visit(optimizer.state)
+    return counts
+
+
+def frozen_snapshot(model):
+    if any(p.requires_grad or p.grad is not None for p in model.parameters()) or model.training:
+        raise ValueError("Frozen component must be in eval mode without trainable parameters or gradients")
+    return {"samples": parameter_probes(model),
+            "versions": {name: (id(p), p._version) for name, p in model.named_parameters()},
+            "buffers": {name: b.detach().cpu().clone() for name, b in model.named_buffers()}}
+
+
+def frozen_diagnostics(model, before):
+    samples = parameter_probes(model)
+    versions = {name: (id(p), p._version) for name, p in model.named_parameters()}
+    buffers = dict(model.named_buffers())
+    changed_parameters = [name for name in before["samples"].keys() | samples.keys()
+                          if name not in samples or name not in before["samples"]
+                          or not torch.equal(samples[name], before["samples"][name])
+                          or versions[name] != before["versions"][name]]
+    changed_buffers = [name for name in before["buffers"].keys() | buffers.keys()
+                       if name not in buffers or name not in before["buffers"]
+                       or not torch.equal(buffers[name].detach().cpu(), before["buffers"][name])]
+    frozen = all(not p.requires_grad and p.grad is None for p in model.parameters()) and not model.training
+    return {"unchanged_under_checks": frozen and not changed_parameters and not changed_buffers,
+            "scope": "parameter samples and mutation counters; exact comparison of all buffers; not a full weight comparison",
+            "changed_parameters": sorted(changed_parameters), "changed_buffers": sorted(changed_buffers),
+            "parameter_tensors_checked": len(samples), "buffer_tensors_checked": len(buffers),
+            "frozen_and_eval": frozen}
+
+
+class SmokeReport:
+    """A few allocator queries at stage boundaries; no CUDA tensors are retained."""
+    def __init__(self, args):
+        self.args = args
+        self.device = None
+        self.stage = "initialization"
+        self.data = {"model": args.model_path, "target_size": args.target_size,
+                     "passed": False, "optimizer_steps": 0, "stage_memory": {},
+                     "memory_scope": "PyTorch CUDA allocator absolute peaks per stage, not allocation deltas"}
+
+    def measure(self):
+        if self.device is None:
+            return
+        memory = {"peak_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+                  "peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device)}
+        self.data["stage_memory"][self.stage] = memory
+        for key in ("allocated", "reserved"):
+            self.data[f"peak_gpu_{key}_bytes"] = max(
+                self.data.get(f"peak_gpu_{key}_bytes", 0), memory[f"peak_{key}_bytes"])
+
+    def start_stage(self, stage):
+        self.measure()
+        self.stage = stage
+        if self.device is not None:
+            torch.cuda.reset_peak_memory_stats(self.device)
+
+    def write(self):
+        self.measure()
+        path = Path(self.args.output_dir, "smoke_diagnostics.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        print(f"Smoke diagnostics: {path} (passed={self.data['passed']})")
+
 
 def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
     """Convert timesteps to sigma values for flow matching."""
@@ -302,6 +551,27 @@ def generate_sample(pipeline, prompt, output_path, steps=25, guidance=3.5):
 # ---------------------------------------------------------------------------
 
 def train(args):
+    smoke = SmokeReport(args) if args.smoke_test else None
+    try:
+        return _train(args, smoke)
+    except torch.OutOfMemoryError as error:
+        if smoke is not None:
+            smoke.data.update(passed=False, error="out_of_memory", error_message=str(error),
+                              failed_stage=smoke.stage)
+            # Do not empty the cache or allocate tensors before capturing the failure peak.
+            smoke.write()
+        raise
+
+
+def _train(args, smoke):
+    dataset = preflight_dataset(args)
+    if smoke is not None:
+        for variable in ("ACCELERATE_USE_FSDP", "ACCELERATE_USE_DEEPSPEED"):
+            if os.environ.get(variable, "").lower() in ("true", "1", "yes"):
+                raise ValueError(f"Smoke test rejects FSDP/DeepSpeed configuration: {variable}")
+    from accelerate import Accelerator
+    from diffusers import FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline
+
     # Setup loggers
     log_with = []
     if args.log_dir:
@@ -320,16 +590,39 @@ def train(args):
     dtype = torch.bfloat16
     is_main = accelerator.is_main_process
     num_processes = accelerator.num_processes
+    if args.smoke_test:
+        preflight_smoke_runtime(accelerator)
+        smoke.device = device
+        torch.cuda.reset_peak_memory_stats(device)
+        smoke.start_stage("model_loading")
+
+    # Smoke mode is deliberately offline: no model downloads, even if files are missing.
+    load_kwargs = {"local_files_only": True} if args.smoke_test else {}
+    if args.smoke_test:
+        from diffusers import Flux2Transformer2DModel
+        model_config = Flux2KleinPipeline.load_config(args.model_path, **load_kwargs)
+        preflight_model_config(model_config)
+        transformer_config = Flux2Transformer2DModel.load_config(
+            args.model_path, subfolder="transformer", **load_kwargs)
+        preflight_9b_architecture(transformer_config)
+        smoke.data["architecture"] = dict(transformer_config)
 
     if is_main:
         print(f"Loading Flux2 Klein pipeline... ({num_processes} GPU{'s' if num_processes > 1 else ''})")
 
     # Each process loads the pipeline independently (DDP: full model per GPU)
-    pipe = Flux2KleinPipeline.from_pretrained(args.model_path, torch_dtype=dtype)
+    pipe = Flux2KleinPipeline.from_pretrained(args.model_path, torch_dtype=dtype, **load_kwargs)
+    if args.smoke_test:
+        preflight_9b_architecture(pipe.transformer.config)
+        preflight_components(pipe, args.target_size)
     transformer = pipe.transformer
     vae = pipe.vae
     text_encoder = pipe.text_encoder
     tokenizer = pipe.tokenizer
+    if smoke is not None:
+        smoke.start_stage("device_placement_and_optimizer_setup")
+    transformer.requires_grad_(True)
+    transformer.train()
 
     # Freeze VAE and text encoder
     vae.requires_grad_(False)
@@ -365,10 +658,11 @@ def train(args):
             transformer.parameters(), lr=args.lr, weight_decay=args.weight_decay
         )
 
-    # Dataset
-    dataset = ImageTextDataset(
-        args.data_dir, target_size=args.target_size, use_cached_latents=args.use_cached_latents
-    )
+    coverage = parameter_coverage(transformer, optimizer)
+    if is_main:
+        counts = {key: value for key, value in coverage.items() if key != "optimizer_membership"}
+        print(f"Preflight: model={args.model_path}, config={dict(transformer.config)}, coverage={counts}")
+
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -389,6 +683,13 @@ def train(args):
     transformer, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         transformer, optimizer, dataloader, lr_scheduler
     )
+    coverage = parameter_coverage(accelerator.unwrap_model(transformer), optimizer)
+    if len(dataloader) == 0:
+        raise ValueError("Prepared dataloader has no batches")
+    if smoke is not None:
+        smoke.data["coverage"] = coverage
+        smoke.start_stage("frozen_baseline")
+        frozen_before = {"vae": frozen_snapshot(vae), "text_encoder": frozen_snapshot(text_encoder)}
 
     # EMA (only on main process to save memory on other GPUs)
     ema = None
@@ -472,6 +773,8 @@ def train(args):
                 break
 
             with accelerator.accumulate(transformer):
+                if smoke is not None:
+                    smoke.start_stage("encoding")
                 # Encode images (VAE is per-GPU, no communication needed)
                 if "latents" in batch:
                     latents = batch["latents"].to(device, dtype=dtype)
@@ -490,6 +793,8 @@ def train(args):
                     )
 
                 # Flow matching: sample timestep and noise
+                if smoke is not None:
+                    smoke.start_stage("forward")
                 bsz = latents.shape[0]
                 u = torch.sigmoid(torch.randn(bsz, device=device))
                 timesteps = (u * 1000).long().clamp(0, 999)
@@ -527,11 +832,51 @@ def train(args):
 
                 # MSE loss
                 loss = F.mse_loss(noise_pred.float(), target.float())
+                if args.smoke_test and not torch.isfinite(loss).item():
+                    smoke.data.update(loss=str(loss.item()), error="non-finite loss")
+                    smoke.write()
+                    raise RuntimeError("Smoke test produced a non-finite loss")
 
+                if smoke is not None:
+                    smoke.data["loss"] = loss.item()
+                    smoke.start_stage("backward")
                 accelerator.backward(loss)
+                if args.smoke_test:
+                    smoke.start_stage("gradient_diagnostics")
+                    unwrapped = accelerator.unwrap_model(transformer)
+                    diagnostics = smoke.data
+                    diagnostics.update(ema_enabled=ema is not None,
+                                       pixel_shape=list(batch["pixel_values"].shape),
+                                       **gradient_diagnostics(unwrapped))
+                    if (diagnostics["missing_gradients"] or diagnostics["nonfinite_gradients"]
+                            or diagnostics["gradient_l2_norm_before_clip"] == 0):
+                        diagnostics.update(passed=False, optimizer_steps=0)
+                        smoke.write()
+                        raise RuntimeError(f"Smoke test gradient failure: {diagnostics}")
+                    before = parameter_probes(unwrapped)
+                    diagnostics["learning_rates_used"] = [float(group["lr"]) for group in optimizer.param_groups]
+                    smoke.start_stage("optimizer_step")
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
                 optimizer.step()
+                if args.smoke_test:
+                    diagnostics["optimizer_step_skipped"] = accelerator.optimizer_step_was_skipped
+                    diagnostics["optimizer_steps"] = int(not accelerator.optimizer_step_was_skipped)
+                    smoke.start_stage("post_step_diagnostics")
+                    diagnostics["optimizer_state_dtypes"] = optimizer_state_dtypes(optimizer)
+                    diagnostics.update(parameter_change_diagnostics(before, parameter_probes(unwrapped)))
+                    diagnostics["frozen_components"] = {
+                        "vae": frozen_diagnostics(vae, frozen_before["vae"]),
+                        "text_encoder": frozen_diagnostics(text_encoder, frozen_before["text_encoder"])}
+                    diagnostics["passed"] = bool(
+                        diagnostics["optimizer_steps"] == 1
+                        and diagnostics["sampled_parameters_finite"]
+                        and diagnostics["changed_sampled_values"] > 0
+                        and all(d["unchanged_under_checks"] for d in diagnostics["frozen_components"].values())
+                    )
+                    smoke.write()
+                    if not diagnostics["passed"]:
+                        raise RuntimeError("Smoke test failed: optimizer skipped, invalid updates, or frozen component changed; see report")
 
                 # LR warmup
                 if global_step < warmup_steps:
@@ -561,7 +906,7 @@ def train(args):
                     ema.update(accelerator.unwrap_model(transformer))
 
                 # Save checkpoint (all processes wait via barrier)
-                if global_step % args.save_every == 0:
+                if not args.smoke_test and global_step % args.save_every == 0:
                     if is_main:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         os.makedirs(save_path, exist_ok=True)
@@ -591,7 +936,7 @@ def train(args):
                     accelerator.wait_for_everyone()
 
                 # Generate sample (main process only, others wait)
-                if (global_step % args.sample_every == 0 and args.sample_prompts):
+                if (not args.smoke_test and global_step % args.sample_every == 0 and args.sample_prompts):
                     if is_main:
                         unwrapped = accelerator.unwrap_model(transformer)
                         unwrapped.eval()
@@ -642,7 +987,7 @@ def train(args):
     accelerator.wait_for_everyone()
 
     # Final save
-    if is_main:
+    if is_main and not args.smoke_test:
         save_path = os.path.join(args.output_dir, "final")
         os.makedirs(save_path, exist_ok=True)
         unwrapped = accelerator.unwrap_model(transformer)
@@ -659,15 +1004,16 @@ def train(args):
     accelerator.wait_for_everyone()
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Flux2 Klein Standalone FFT")
     # Model
-    parser.add_argument("--model_path", type=str, default="black-forest-labs/FLUX.2-klein-base-4B")
+    parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, required=True)
     # Data
     parser.add_argument("--data_dir", type=str, required=True)
-    parser.add_argument("--target_size", type=int, default=1024)
+    parser.add_argument("--target_size", type=int, default=None)
     parser.add_argument("--use_cached_latents", action="store_true")
+    parser.add_argument("--smoke_test", action="store_true", help="Offline Base 9B single-GPU, one-step run; requires explicit --model_path and --target_size (e.g. 256); disables EMA, caching, resume, samples and checkpoints")
     # Training
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--grad_accum", type=int, default=2)
@@ -682,6 +1028,7 @@ def main():
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint dir to resume from")
     # EMA
     parser.add_argument("--use_ema", action="store_true", default=True)
+    parser.add_argument("--no_ema", dest="use_ema", action="store_false", help="Disable EMA shadow weights")
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     # Logging & Saving
     parser.add_argument("--save_every", type=int, default=5000)
@@ -697,8 +1044,20 @@ def main():
     parser.add_argument("--wandb_project", type=str, default="flux2-klein-finetune")
     parser.add_argument("--wandb_run_name", type=str, default=None)
 
-    args = parser.parse_args()
-    train(args)
+    args = parser.parse_args(argv)
+    if args.smoke_test:
+        if args.model_path is None or args.target_size is None:
+            parser.error("--smoke_test requires explicit --model_path (Klein Base 9B) and --target_size (e.g. 256)")
+    else:
+        if args.model_path is None:
+            args.model_path = "black-forest-labs/FLUX.2-klein-base-4B"
+        if args.target_size is None:
+            args.target_size = 1024
+    return args
+
+
+def main():
+    train(parse_args())
 
 
 if __name__ == "__main__":
