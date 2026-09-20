@@ -450,6 +450,80 @@ def optimizer_details(model, optimizer):
     return {"param_groups": groups, "states_by_parameter": states}
 
 
+def optimizer_step_snapshot(model, optimizer, kind):
+    """Copy scalar evidence only; never clone moment tensors or initialize state.
+
+    Schemas: torch.optim.AdamW; transformers.optimization.Adafactor;
+    bitsandbytes.optim.AdamW8bit (Optimizer2State.init_state/update_step).
+    Unknown/version-incompatible schemas are insufficient, not assumed successful.
+    """
+    supported = kind in ("adamw", "adafactor", "adamw8bit")
+    groups = {id(p): group for group in optimizer.param_groups for p in group["params"]}
+    entries = {}
+    for name, p in model.named_parameters():
+        state = optimizer.state.get(p, {})
+        group = groups.get(id(p), {})
+        shapes = {}
+        if kind == "adamw":
+            shapes = {"exp_avg": p.shape, "exp_avg_sq": p.shape}
+            if group.get("amsgrad", False):
+                shapes["max_exp_avg_sq"] = p.shape
+        elif kind == "adafactor":
+            shapes = ({"exp_avg_sq_row": p.shape[:-1], "exp_avg_sq_col": p.shape[:-2] + p.shape[-1:]}
+                      if p.ndim >= 2 else {"exp_avg_sq": p.shape})
+            if group.get("beta1") is not None:
+                shapes["exp_avg"] = p.shape
+        elif kind == "adamw8bit":
+            # Both uint8 and small-tensor FP32 fallback states use these names.
+            # Source: bitsandbytes/optim/optimizer.py, Optimizer2State.
+            shapes = {"state1": p.shape, "state2": p.shape}
+        invalid = [key for key, shape in shapes.items()
+                   if not isinstance(state.get(key), torch.Tensor) or state[key].shape != shape]
+        step = state.get("step")
+        if isinstance(step, torch.Tensor):
+            step = step.item() if step.numel() == 1 else None
+        if (isinstance(step, bool) or not isinstance(step, (int, float))
+                or not math.isfinite(step) or step < 0 or int(step) != step):
+            step = None
+        entries[name] = {"has_gradient": p.grad is not None, "state_initialized": bool(state),
+                         "state_keys": sorted(str(key) for key in state),
+                         "counter_available": step is not None, "step": step,
+                         "invalid_or_missing_state_tensors": invalid,
+                         "state_schema_valid": supported and bool(state) and not invalid and id(p) in groups}
+    return {"optimizer": kind, "schema_supported": supported, "parameters": entries}
+
+
+def verify_optimizer_step(before, after, skipped):
+    failures = {}
+    supported = before["schema_supported"] and after["schema_supported"] and before["optimizer"] == after["optimizer"]
+    for name in before["parameters"].keys() | after["parameters"].keys():
+        previous, current = before["parameters"].get(name), after["parameters"].get(name)
+        reason = None
+        if previous is None or current is None:
+            reason = "parameter inventory changed"
+        elif not previous["has_gradient"]:
+            reason = "no pre-step gradient"
+        elif not current["state_schema_valid"]:
+            reason = "optimizer state absent, incomplete, or unsupported"
+        elif previous["state_initialized"] and (not previous["state_schema_valid"] or previous["step"] is None):
+            reason = "pre-existing state has insufficient baseline evidence"
+        else:
+            baseline = previous["step"] if previous["state_initialized"] else 0
+            if current["step"] is None:
+                reason = "missing or invalid step counter"
+            elif current["step"] != baseline + 1:
+                reason = "step counter did not advance exactly once"
+        if reason:
+            failures[name] = reason
+    sufficient = supported and bool(before["parameters"]) and not skipped and not failures
+    return {"sufficient": sufficient, "schema_supported": supported, "accelerator_skipped": skipped,
+            "reason": ("state initialized and counters advanced once for all parameters" if sufficient else
+                       "unsupported optimizer schema" if not supported else
+                       "Accelerate reported a skipped update" if skipped else "insufficient per-parameter step evidence"),
+            "parameter_failures": failures, "before": before, "after": after,
+            "scope": "state/counter transition after synchronized return; independent of stored-weight changes; not proof against a deliberately falsified optimizer"}
+
+
 def dependency_versions():
     versions = {"torch": torch.__version__, "cuda_runtime": torch.version.cuda}
     for name in ("diffusers", "accelerate", "transformers", "bitsandbytes", "safetensors", "torchvision"):
@@ -566,6 +640,7 @@ class SmokeReport:
         self.data = {"model": args.model_path, "target_size": args.target_size,
                      "seed": args.seed, "dependency_versions": dependency_versions(),
                      "passed": False, "optimizer_steps": 0, "optimizer_step_completed": False,
+                     "optimizer_step_returned": False,
                      "stored_weight_changes_observed": None, "stage_memory": {},
                      "memory_scope": "PyTorch CUDA allocator absolute peaks per stage, not allocation deltas"}
 
@@ -1041,12 +1116,18 @@ def _train(args, smoke):
                         smoke.write()
                         raise RuntimeError("Smoke test gradient failure after clipping")
                     smoke.start_stage("optimizer_step")
+                    step_before = optimizer_step_snapshot(unwrapped, optimizer, args.optimizer)
                 optimizer.step()
                 if args.smoke_test:
                     torch.cuda.synchronize(device)
+                    diagnostics["optimizer_step_returned"] = True
                     diagnostics["optimizer_step_skipped"] = accelerator.optimizer_step_was_skipped
-                    diagnostics["optimizer_steps"] = int(not accelerator.optimizer_step_was_skipped)
-                    diagnostics["optimizer_step_completed"] = not accelerator.optimizer_step_was_skipped
+                    evidence = verify_optimizer_step(
+                        step_before, optimizer_step_snapshot(unwrapped, optimizer, args.optimizer),
+                        accelerator.optimizer_step_was_skipped)
+                    diagnostics["optimizer_step_evidence"] = evidence
+                    diagnostics["optimizer_steps"] = int(evidence["sufficient"])
+                    diagnostics["optimizer_step_completed"] = evidence["sufficient"]
                     smoke.start_stage("post_step_diagnostics")
                     diagnostics["optimizer_state_dtypes"] = optimizer_state_dtypes(optimizer)
                     diagnostics["optimizer_details_after_step"] = optimizer_details(unwrapped, optimizer)
@@ -1061,10 +1142,10 @@ def _train(args, smoke):
                         and diagnostics["sampled_parameters_finite"]
                         and all(d["unchanged_under_checks"] for d in diagnostics["frozen_components"].values())
                     )
-                    diagnostics["passed_scope"] = "completed finite one-step execution and frozen checks; stored-weight changes reported separately, not a training-quality certification"
+                    diagnostics["passed_scope"] = "verified optimizer state/counter transition, finite diagnostics and frozen checks; stored-weight changes reported separately, not a training-quality certification"
                     smoke.write()
                     if not diagnostics["passed"]:
-                        raise RuntimeError("Smoke test failed: optimizer skipped, invalid updates, or frozen component changed; see report")
+                        raise RuntimeError("Smoke test failed: insufficient optimizer-step evidence, invalid updates, or frozen component changed; see report")
 
                 # LR warmup
                 if global_step < warmup_steps:

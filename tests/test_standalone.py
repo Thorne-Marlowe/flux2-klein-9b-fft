@@ -326,8 +326,12 @@ class StandaloneTests(unittest.TestCase):
 
     def run_mocked_loop(self, *, failure=None, ordinary=False, mutate_buffer=False,
                         partial_update=False, invalid_metadata=False, no_update=False,
-                        bad_clip=False, optimizer_name="adamw"):
+                        bad_clip=False, optimizer_name="adamw", rounded_updates=False):
         pipe = self.tiny_pipe()
+        if rounded_updates:
+            with torch.no_grad():
+                for p in pipe.transformer.parameters():
+                    p.fill_(1.)
         pipe.vae.encode = Mock(wraps=pipe.vae.encode)
         pipeline = Mock()
         pipeline.load_config.return_value = BASE_CONFIG
@@ -434,6 +438,8 @@ class StandaloneTests(unittest.TestCase):
         self.assertFalse(report["optimizer"]["configuration"][0]["foreach"])
         self.assertEqual(report["optimizer"]["configuration"][0]["weight_decay"], 0.01)
         self.assertTrue(report["optimizer_step_completed"])
+        self.assertTrue(report["optimizer_step_returned"])
+        self.assertTrue(report["optimizer_step_evidence"]["sufficient"])
         self.assertIn("gradients_after_clip", report)
         self.assertGreater(report["memory_after_step"]["optimizer_state"]["total_bytes"], 0)
         self.assertEqual(report["optimizer_details_after_step"]["states_by_parameter"]["weight"]["step"], 1)
@@ -495,10 +501,12 @@ class StandaloneTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertEqual(report["frozen_encoding_checks"]["vae"]["changed_buffers"], ["bn.num_batches_tracked"])
 
-    def test_mocked_smoke_does_not_require_every_tensor_to_change(self):
-        self.run_mocked_loop(partial_update=True)
+    def test_weight_change_alone_is_insufficient_step_evidence(self):
+        with self.assertRaisesRegex(RuntimeError, "insufficient optimizer-step evidence"):
+            self.run_mocked_loop(partial_update=True)
         report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
-        self.assertTrue(report["passed"])
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["optimizer_step_completed"])
         self.assertEqual(report["parameter_change_details"]["weight"]["changed_values"], 0)
         self.assertGreater(report["parameter_change_details"]["bias"]["changed_values"], 0)
 
@@ -571,14 +579,97 @@ class StandaloneTests(unittest.TestCase):
         torch.testing.assert_close(samples["weight"], before)
         self.assertEqual([r["lr"] for r in trainer.precision_probe(samples, 1e-5, 0.0)["results"]], [3e-5, 1e-5])
 
-    def test_completed_step_is_separate_from_stored_weight_changes(self):
-        self.run_mocked_loop(no_update=True)
+    def test_noop_step_cannot_pass(self):
+        with self.assertRaisesRegex(RuntimeError, "insufficient optimizer-step evidence"):
+            self.run_mocked_loop(no_update=True)
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertTrue(report["optimizer_step_returned"])
+        self.assertFalse(report["optimizer_step_completed"])
+        self.assertEqual(report["optimizer_steps"], 0)
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["optimizer_step_evidence"]["sufficient"])
+
+    def test_real_bf16_step_can_pass_without_stored_weight_changes(self):
+        self.run_mocked_loop(rounded_updates=True)
         report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
         self.assertTrue(report["optimizer_step_completed"])
         self.assertEqual(report["optimizer_steps"], 1)
         self.assertFalse(report["stored_weight_changes_observed"])
         self.assertTrue(report["passed"])
         self.assertEqual(report["learning_rates_used"], [3e-5])
+
+    def test_adamw_evidence_checks_real_counters_and_rejects_noop_on_existing_state(self):
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
+        for p in model.parameters():
+            p.grad = torch.ones_like(p)
+        before = trainer.optimizer_step_snapshot(model, optimizer, "adamw")
+        self.assertFalse(before["parameters"]["weight"]["state_initialized"])
+        self.assertEqual(len(optimizer.state), 0)
+        optimizer.step()
+        after = trainer.optimizer_step_snapshot(model, optimizer, "adamw")
+        self.assertTrue(trainer.verify_optimizer_step(before, after, False)["sufficient"])
+        self.assertIsNone(before["parameters"]["weight"]["step"])  # Snapshot cannot alias the live counter.
+        self.assertFalse(trainer.verify_optimizer_step(after, after, False)["sufficient"])
+        self.assertFalse(trainer.verify_optimizer_step(before, after, True)["sufficient"])
+        optimizer.step()
+        second = trainer.optimizer_step_snapshot(model, optimizer, "adamw")
+        self.assertTrue(trainer.verify_optimizer_step(after, second, False)["sufficient"])
+        self.assertFalse(trainer.verify_optimizer_step(before, second, False)["sufficient"])
+
+    def test_missing_malformed_and_partial_optimizer_evidence_fails_closed(self):
+        for problem in ("counter", "moments", "counter_only", "partial", "bad_shape", "nan", "vector", "fraction"):
+            with self.subTest(problem=problem):
+                model = torch.nn.Linear(2, 1)
+                optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
+                for p in model.parameters():
+                    p.grad = torch.ones_like(p)
+                before = trainer.optimizer_step_snapshot(model, optimizer, "adamw")
+                optimizer.step()
+                state = optimizer.state[model.weight]
+                if problem == "counter":
+                    del state["step"]
+                elif problem == "moments":
+                    del state["exp_avg_sq"]
+                elif problem == "counter_only":
+                    optimizer.state[model.weight] = {"step": 1}
+                elif problem == "partial":
+                    optimizer.state[model.bias].clear()
+                elif problem == "bad_shape":
+                    state["exp_avg"] = torch.zeros(1)
+                else:
+                    state["step"] = {"nan": float("nan"), "vector": torch.ones(2), "fraction": 1.5}[problem]
+                after = trainer.optimizer_step_snapshot(model, optimizer, "adamw")
+                self.assertFalse(trainer.verify_optimizer_step(before, after, False)["sufficient"])
+
+    def test_unknown_optimizer_schema_is_explicitly_unsupported(self):
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        before = trainer.optimizer_step_snapshot(model, optimizer, "sgd")
+        evidence = trainer.verify_optimizer_step(before, before, False)
+        self.assertFalse(evidence["schema_supported"])
+        self.assertFalse(evidence["sufficient"])
+        self.assertEqual(evidence["reason"], "unsupported optimizer schema")
+
+    def test_adamw8bit_documented_state_schema_fixture_not_cuda_execution(self):
+        # Actual bitsandbytes is unavailable. These are documented Optimizer2State
+        # layouts, testing only parsing/transition checks, not an optimizer kernel.
+        for dtype in (torch.uint8, torch.float32):
+            with self.subTest(dtype=dtype):
+                model = torch.nn.Linear(2, 1)
+                optimizer = SimpleNamespace(param_groups=[{"params": list(model.parameters())}], state={})
+                for p in model.parameters():
+                    p.grad = torch.ones_like(p)
+                before = trainer.optimizer_step_snapshot(model, optimizer, "adamw8bit")
+                for p in model.parameters():
+                    optimizer.state[p] = {"state1": torch.zeros_like(p, dtype=dtype),
+                                          "state2": torch.zeros_like(p, dtype=dtype), "step": 1}
+                after = trainer.optimizer_step_snapshot(model, optimizer, "adamw8bit")
+                self.assertTrue(trainer.verify_optimizer_step(before, after, False)["sufficient"])
+                self.assertFalse(trainer.verify_optimizer_step(after, after, False)["sufficient"])
+                del optimizer.state[model.weight]["step"]
+                missing = trainer.optimizer_step_snapshot(model, optimizer, "adamw8bit")
+                self.assertFalse(trainer.verify_optimizer_step(before, missing, False)["sufficient"])
 
     def test_bad_post_clip_gradients_fail_before_optimizer_step(self):
         with self.assertRaisesRegex(RuntimeError, "after clipping"):
@@ -600,6 +691,10 @@ class StandaloneTests(unittest.TestCase):
         self.assertFalse(report["optimizer"]["configuration"][0]["relative_step"])
         self.assertEqual(report["optimizer_details_after_step"]["states_by_parameter"]["weight"]["step"], 1)
         self.assertIn("exp_avg_sq_row", report["optimizer_details_after_step"]["states_by_parameter"]["weight"]["keys"])
+        self.assertTrue(report["optimizer_step_evidence"]["sufficient"])
+        after = report["optimizer_step_evidence"]["after"]["parameters"]
+        self.assertIn("exp_avg_sq_col", after["weight"]["state_keys"])
+        self.assertIn("exp_avg_sq", after["bias"]["state_keys"])
 
     def test_missing_dependency_versions_are_explicit(self):
         with patch.object(trainer.importlib.metadata, "version", side_effect=trainer.importlib.metadata.PackageNotFoundError):
