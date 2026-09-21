@@ -654,16 +654,14 @@ class SmokeReport:
                   "peak_reserved_bytes": torch.cuda.max_memory_reserved(self.device)}
         # Device-wide usage includes other processes and non-PyTorch allocations;
         # it is an instantaneous boundary observation, NOT a measured device peak.
-        try:
-            free, total = torch.cuda.mem_get_info(self.device)
-            memory["device_memory_at_boundary"] = {"free_bytes": free, "total_bytes": total,
-                                                    "used_bytes": total - free}
-        except RuntimeError as error:
-            memory["device_memory_query_error"] = str(error)
+        # Preserve allocator peaks even if the subsequent device-wide query fails.
         self.data["stage_memory"][self.stage] = memory
         for key in ("allocated", "reserved"):
             self.data[f"peak_gpu_{key}_bytes"] = max(
                 self.data.get(f"peak_gpu_{key}_bytes", 0), memory[f"peak_{key}_bytes"])
+        free, total = torch.cuda.mem_get_info(self.device)
+        memory["device_memory_at_boundary"] = {"free_bytes": free, "total_bytes": total,
+                                                "used_bytes": total - free}
 
     def start_stage(self, stage):
         self.measure()
@@ -672,18 +670,21 @@ class SmokeReport:
             torch.cuda.reset_peak_memory_stats(self.device)
 
     def write(self):
-        # CUDA queries can themselves fail after a device error. Still publish the
-        # original failure and any peaks captured before it.
+        # Only failure reporting may tolerate secondary diagnostic errors.
         try:
             self.measure()
         except Exception as error:
+            if self.data["status"] != "failed" or self.data["passed"]:
+                raise
             self.data["memory_reporting_error"] = f"{type(error).__name__}: {error}"
         path = Path(self.args.output_dir, "smoke_diagnostics.json")
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        # Flush logging before publishing: a broken stdout must not invalidate an
+        # already-published success. Atomic replacement is the final operation.
+        print(f"Publishing smoke diagnostics: {path} (passed={self.data['passed']})", flush=True)
         temporary.replace(path)
-        print(f"Smoke diagnostics: {path} (passed={self.data['passed']})")
 
 
 def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):

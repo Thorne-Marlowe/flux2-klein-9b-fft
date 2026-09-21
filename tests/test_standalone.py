@@ -327,7 +327,7 @@ class StandaloneTests(unittest.TestCase):
     def run_mocked_loop(self, *, failure=None, ordinary=False, mutate_buffer=False,
                         partial_update=False, invalid_metadata=False, no_update=False,
                         bad_clip=False, optimizer_name="adamw", rounded_updates=False,
-                        failure_type=torch.OutOfMemoryError):
+                        failure_type=torch.OutOfMemoryError, tracker=False):
         pipe = self.tiny_pipe()
         if rounded_updates:
             with torch.no_grad():
@@ -355,6 +355,8 @@ class StandaloneTests(unittest.TestCase):
         args = self.args(*flags, "--target_size", "32", "--optimizer", optimizer_name,
                          "--save_every", "2" if ordinary else "1",
                          "--sample_every", "2" if ordinary else "1")
+        if tracker:
+            args.log_dir = str(self.root / "logs")
         if ordinary:
             pipeline.load_config.side_effect = AssertionError("Ordinary training must not require optional metadata")
             pipe.transformer.save_pretrained.side_effect = None
@@ -370,7 +372,9 @@ class StandaloneTests(unittest.TestCase):
             stack.enter_context(patch.object(torch.cuda, "reset_peak_memory_stats"))
             stack.enter_context(patch.object(torch.cuda, "mem_get_info", return_value=(1024, 2048)))
             stack.enter_context(patch.object(torch.cuda, "get_device_name", return_value="mock CUDA device"))
-            stack.enter_context(patch.object(torch.cuda, "synchronize"))
+            stack.enter_context(patch.object(torch.cuda, "synchronize", side_effect=(
+                [None, RuntimeError("synthetic final synchronization failure")]
+                if failure == "final_sync" else None)))
             stack.enter_context(patch.object(torch.cuda, "empty_cache"))
             stack.enter_context(patch.object(torch.cuda, "max_memory_allocated", return_value=123))
             stack.enter_context(patch.object(torch.cuda, "max_memory_reserved", return_value=456))
@@ -565,7 +569,7 @@ class StandaloneTests(unittest.TestCase):
         args = self.args("--smoke_test", "--target_size", "32", "--optimizer", "adamw")
         error = ValueError("original failure")
         with patch.object(trainer, "_train", side_effect=error), \
-             patch.object(trainer.SmokeReport, "measure", side_effect=RuntimeError("CUDA query failed")):
+             patch.object(trainer.SmokeReport, "measure", side_effect=[None, RuntimeError("CUDA query failed")]):
             with self.assertRaises(ValueError) as caught:
                 trainer.train(args)
         self.assertIs(caught.exception, error)
@@ -573,6 +577,104 @@ class StandaloneTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertEqual(report["exception_type"], "ValueError")
         self.assertIn("CUDA query failed", report["memory_reporting_error"])
+
+    def test_final_success_measurement_errors_fail_including_oom(self):
+        original_measure = trainer.SmokeReport.measure
+        for error_type in (torch.OutOfMemoryError, RuntimeError):
+            error = error_type("synthetic final measurement failure")
+            def measure(report):
+                if report.stage == "finalization":
+                    with patch.object(torch.cuda, "mem_get_info", side_effect=error):
+                        return original_measure(report)
+                return original_measure(report)
+            with self.subTest(error_type=error_type), \
+                 patch.object(trainer.SmokeReport, "measure", measure):
+                with self.assertRaises(error_type) as caught:
+                    self.run_mocked_loop()
+            self.assertIs(caught.exception, error)
+            report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["failed_stage"], "finalization")
+            self.assertEqual(report["exception_type"], error_type.__name__)
+            self.assertTrue(report["optimizer_step_completed"])
+            self.assertTrue(report["cleanup_completed"])
+            self.assertIn("synthetic final measurement failure", report["memory_reporting_error"])
+            self.assertEqual(report["peak_gpu_allocated_bytes"], 123)
+            if error_type is torch.OutOfMemoryError:
+                self.assertEqual(report["error"], "out_of_memory")
+
+    def test_broken_stdout_and_failed_rewrite_cannot_publish_success(self):
+        path = self.root / "out" / "smoke_diagnostics.json"
+        broken = BrokenPipeError("synthetic broken stdout")
+        rewrite_failed = Mock()
+        stdout_failed = False
+        original_write = Path.write_text
+        def printing(*values, **kwargs):
+            nonlocal stdout_failed
+            if "(passed=True)" in str(values):
+                self.assertFalse(json.loads(path.read_text())["passed"])
+                self.assertTrue(kwargs.get("flush"))
+                stdout_failed = True
+                raise broken
+        def writing(file, contents, *args, **kwargs):
+            if stdout_failed:
+                rewrite_failed()
+                raise PermissionError("synthetic report rewrite failure")
+            return original_write(file, contents, *args, **kwargs)
+        with patch.object(trainer, "print", printing, create=True), \
+             patch.object(Path, "write_text", writing):
+            with self.assertRaises(BrokenPipeError) as caught:
+                self.run_mocked_loop()
+        self.assertIs(caught.exception, broken)
+        rewrite_failed.assert_called_once()
+        report = json.loads(path.read_text())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"], "running")
+
+    def test_final_synchronization_failure_cannot_publish_success(self):
+        with self.assertRaisesRegex(RuntimeError, "final synchronization failure"):
+            self.run_mocked_loop(failure="final_sync")
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["cleanup_completed"])
+        self.assertTrue(report["optimizer_step_completed"])
+        self.assertEqual(report["failed_stage"], "cleanup")
+        self.assertEqual(report["exception_type"], "RuntimeError")
+
+    def test_tracker_shutdown_failure_cannot_publish_success(self):
+        path = self.root / "out" / "smoke_diagnostics.json"
+        def shutdown():
+            self.assertFalse(json.loads(path.read_text())["passed"])
+            raise RuntimeError("synthetic tracker shutdown failure")
+        with patch.object(TinyAccelerator, "init_trackers", create=True) as initialize, \
+             patch.object(TinyAccelerator, "end_training", side_effect=shutdown, create=True) as finish:
+            with self.assertRaisesRegex(RuntimeError, "tracker shutdown failure"):
+                self.run_mocked_loop(tracker=True)
+        initialize.assert_called_once()
+        finish.assert_called_once()
+        report = json.loads(path.read_text())
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["cleanup_completed"])
+        self.assertTrue(report["optimizer_step_completed"])
+        self.assertEqual(report["failed_stage"], "cleanup")
+
+    def test_success_replacement_failure_fails_process(self):
+        original_replace = Path.replace
+        error = PermissionError("synthetic publication failure")
+        def replace(source, destination):
+            if json.loads(source.read_text())["passed"]:
+                self.assertFalse(json.loads(destination.read_text())["passed"])
+                raise error
+            return original_replace(source, destination)
+        with patch.object(Path, "replace", replace):
+            with self.assertRaises(PermissionError) as caught:
+                self.run_mocked_loop()
+        self.assertIs(caught.exception, error)
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["failed_stage"], "finalization")
 
     def test_unwritable_report_preserves_original_exception(self):
         args = self.args("--smoke_test", "--target_size", "32", "--optimizer", "adamw")
