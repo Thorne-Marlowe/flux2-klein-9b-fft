@@ -39,7 +39,9 @@ import json
 import math
 import os
 import random
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import torch
@@ -640,6 +642,7 @@ class SmokeReport:
         self.data = {"model": args.model_path, "target_size": args.target_size,
                      "seed": args.seed, "dependency_versions": dependency_versions(),
                      "passed": False, "optimizer_steps": 0, "optimizer_step_completed": False,
+                     "status": "running", "cleanup_completed": False,
                      "optimizer_step_returned": False,
                      "stored_weight_changes_observed": None, "stage_memory": {},
                      "memory_scope": "PyTorch CUDA allocator absolute peaks per stage, not allocation deltas"}
@@ -669,10 +672,17 @@ class SmokeReport:
             torch.cuda.reset_peak_memory_stats(self.device)
 
     def write(self):
-        self.measure()
+        # CUDA queries can themselves fail after a device error. Still publish the
+        # original failure and any peaks captured before it.
+        try:
+            self.measure()
+        except Exception as error:
+            self.data["memory_reporting_error"] = f"{type(error).__name__}: {error}"
         path = Path(self.args.output_dir, "smoke_diagnostics.json")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        temporary.replace(path)
         print(f"Smoke diagnostics: {path} (passed={self.data['passed']})")
 
 
@@ -769,18 +779,36 @@ def generate_sample(pipeline, prompt, output_path, steps=25, guidance=3.5):
 def train(args):
     smoke = SmokeReport(args) if args.smoke_test else None
     try:
-        return _train(args, smoke)
-    except torch.OutOfMemoryError as error:
         if smoke is not None:
-            smoke.data.update(passed=False, error="out_of_memory", error_message=str(error),
-                              failed_stage=smoke.stage)
-            # Do not empty the cache or allocate tensors before capturing the failure peak.
+            # Invalidate a previous run's success before preflight or imports.
             smoke.write()
+        result = _train(args, smoke)
+        if smoke is not None:
+            if not smoke.data.get("step_checks_passed", False):
+                raise RuntimeError("Smoke test ended without verified optimizer-step checks")
+            smoke.start_stage("finalization")
+            smoke.data.update(passed=True, status="completed", cleanup_completed=True)
+            smoke.write()
+        return result
+    except Exception as error:
+        if smoke is not None:
+            smoke.data.update(passed=False, status="failed",
+                              error=("out_of_memory" if isinstance(error, torch.OutOfMemoryError)
+                                     else smoke.data.get("error", "unexpected_exception")),
+                              exception_type=type(error).__name__, error_message=str(error),
+                              failed_stage=smoke.stage, traceback=traceback.format_exc())
+            # Do not empty the cache or allocate tensors before capturing the failure peak.
+            try:
+                smoke.write()
+            except Exception as report_error:
+                # An unwritable output directory must not hide the original failure.
+                print(f"Failed to write smoke diagnostics: {report_error}", file=sys.stderr)
         raise
 
 
 def _train(args, smoke):
     if smoke is not None:
+        smoke.start_stage("preflight")
         if args.optimizer is None:
             raise ValueError("Smoke test requires an explicit --optimizer")
         random.seed(args.seed)
@@ -790,6 +818,8 @@ def _train(args, smoke):
         for variable in ("ACCELERATE_USE_FSDP", "ACCELERATE_USE_DEEPSPEED"):
             if os.environ.get(variable, "").lower() in ("true", "1", "yes"):
                 raise ValueError(f"Smoke test rejects FSDP/DeepSpeed configuration: {variable}")
+    if smoke is not None:
+        smoke.start_stage("dependency_imports")
     from accelerate import Accelerator
     from diffusers import FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline
 
@@ -800,6 +830,8 @@ def _train(args, smoke):
     if args.wandb:
         log_with.append("wandb")
 
+    if smoke is not None:
+        smoke.start_stage("runtime_setup")
     accelerator = Accelerator(
         gradient_accumulation_steps=args.grad_accum,
         mixed_precision="bf16",
@@ -1137,15 +1169,15 @@ def _train(args, smoke):
                     diagnostics["frozen_components"] = {
                         "vae": frozen_diagnostics(vae, frozen_before["vae"]),
                         "text_encoder": frozen_diagnostics(text_encoder, frozen_before["text_encoder"])}
-                    diagnostics["passed"] = bool(
+                    diagnostics["step_checks_passed"] = bool(
                         diagnostics["optimizer_steps"] == 1
                         and diagnostics["sampled_parameters_finite"]
                         and all(d["unchanged_under_checks"] for d in diagnostics["frozen_components"].values())
                     )
                     diagnostics["passed_scope"] = "verified optimizer state/counter transition, finite diagnostics and frozen checks; stored-weight changes reported separately, not a training-quality certification"
-                    smoke.write()
-                    if not diagnostics["passed"]:
+                    if not diagnostics["step_checks_passed"]:
                         raise RuntimeError("Smoke test failed: insufficient optimizer-step evidence, invalid updates, or frozen component changed; see report")
+                    smoke.start_stage("step_finalization")
 
                 # LR warmup
                 if global_step < warmup_steps:
@@ -1252,6 +1284,8 @@ def _train(args, smoke):
                             "train/step": global_step,
                         }, step=global_step)
 
+    if smoke is not None:
+        smoke.start_stage("cleanup")
     progress.close()
     accelerator.wait_for_everyone()
 
@@ -1271,6 +1305,8 @@ def _train(args, smoke):
     if is_main and log_with:
         accelerator.end_training()
     accelerator.wait_for_everyone()
+    if smoke is not None:
+        torch.cuda.synchronize(device)
 
 
 def parse_args(argv=None):

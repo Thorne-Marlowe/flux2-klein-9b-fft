@@ -326,7 +326,8 @@ class StandaloneTests(unittest.TestCase):
 
     def run_mocked_loop(self, *, failure=None, ordinary=False, mutate_buffer=False,
                         partial_update=False, invalid_metadata=False, no_update=False,
-                        bad_clip=False, optimizer_name="adamw", rounded_updates=False):
+                        bad_clip=False, optimizer_name="adamw", rounded_updates=False,
+                        failure_type=torch.OutOfMemoryError):
         pipe = self.tiny_pipe()
         if rounded_updates:
             with torch.no_grad():
@@ -377,24 +378,24 @@ class StandaloneTests(unittest.TestCase):
             stack.enter_context(patch.object(trainer, "generate_sample", side_effect=AssertionError("sample generated")))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             if failure == "model_loading":
-                pipeline.from_pretrained.side_effect = torch.OutOfMemoryError("synthetic load OOM")
+                pipeline.from_pretrained.side_effect = failure_type("synthetic load failure")
             elif failure == "backward":
                 stack.enter_context(patch.object(TinyAccelerator, "backward",
-                                                side_effect=torch.OutOfMemoryError("synthetic backward OOM")))
+                                                side_effect=failure_type("synthetic backward failure")))
             elif failure == "optimizer_step":
                 original_step = torch.optim.AdamW.step
                 def step(optimizer, *args, **kwargs):
                     if any(p is pipe.transformer.weight for g in optimizer.param_groups for p in g["params"]):
-                        raise torch.OutOfMemoryError("synthetic optimizer OOM")
+                        raise failure_type("synthetic optimizer failure")
                     return original_step(optimizer, *args, **kwargs)
                 stack.enter_context(patch.object(torch.optim.AdamW, "step", step))
             elif failure in ("vae_encoding", "text_encoding"):
                 target = pipe.vae if failure == "vae_encoding" else pipeline
                 name = "encode" if failure == "vae_encoding" else "_get_qwen3_prompt_embeds"
                 if failure == "text_encoding":
-                    pipe._get_qwen3_prompt_embeds.side_effect = torch.OutOfMemoryError("synthetic encoding OOM")
+                    pipe._get_qwen3_prompt_embeds.side_effect = failure_type("synthetic encoding failure")
                 else:
-                    stack.enter_context(patch.object(target, name, side_effect=torch.OutOfMemoryError("synthetic encoding OOM")))
+                    stack.enter_context(patch.object(target, name, side_effect=failure_type("synthetic encoding failure")))
             if mutate_buffer:
                 original_encode = pipe.vae.encode
                 def encode(images):
@@ -429,6 +430,9 @@ class StandaloneTests(unittest.TestCase):
         args, pipe, pipeline, transformer_class = self.run_mocked_loop()
         report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
         self.assertTrue(report["passed"])
+        self.assertEqual(report["status"], "completed")
+        self.assertTrue(report["cleanup_completed"])
+        self.assertTrue(report["step_checks_passed"])
         self.assertEqual(report["optimizer_steps"], 1)
         self.assertGreater(report["changed_sampled_values"], 0)
         self.assertEqual(report["peak_gpu_allocated_bytes"], 123)
@@ -493,6 +497,93 @@ class StandaloneTests(unittest.TestCase):
             self.assertEqual(report["failed_stage"], stage)
             self.assertEqual(report["peak_gpu_allocated_bytes"], 123)
             self.assertEqual(report["stage_memory"][stage]["peak_reserved_bytes"], 456)
+
+    def test_unexpected_exceptions_replace_stale_success_and_identify_stage(self):
+        path = self.root / "out" / "smoke_diagnostics.json"
+        path.parent.mkdir(exist_ok=True)
+        for stage in ("model_loading", "vae_encoding", "text_encoding", "backward", "optimizer_step"):
+            path.write_text('{"passed": true, "stale": true}')
+            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, "synthetic"):
+                self.run_mocked_loop(failure=stage, failure_type=ValueError)
+            report = json.loads(path.read_text())
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["failed_stage"], stage)
+            self.assertEqual(report["exception_type"], "ValueError")
+            self.assertIn("synthetic", report["error_message"])
+            self.assertIn("ValueError", report["traceback"])
+            self.assertNotIn("stale", report)
+
+    def test_preflight_and_import_failures_get_fresh_reports(self):
+        for stage, target, error in (
+            ("preflight", "preflight_dataset", ValueError("bad dataset")),
+            ("dependency_imports", None, ImportError("missing accelerate")),
+        ):
+            with contextlib.ExitStack() as stack:
+                if target:
+                    stack.enter_context(patch.object(trainer, target, side_effect=error))
+                else:
+                    import builtins
+                    original_import = builtins.__import__
+                    def importing(name, *args, **kwargs):
+                        if name == "accelerate":
+                            raise error
+                        return original_import(name, *args, **kwargs)
+                    stack.enter_context(patch.object(builtins, "__import__", importing))
+                with self.subTest(stage=stage), self.assertRaises(type(error)):
+                    self.run_mocked_loop()
+            report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["failed_stage"], stage)
+            self.assertEqual(report["exception_type"], type(error).__name__)
+
+    def test_cleanup_failure_cannot_publish_success(self):
+        path = self.root / "out" / "smoke_diagnostics.json"
+        def fail_cleanup(*args):
+            self.assertFalse(json.loads(path.read_text())["passed"])
+            raise RuntimeError("synthetic cleanup failure")
+        for method in ("wait_for_everyone", "close"):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(self.subTest(method=method))
+                if method == "close":
+                    # Avoid making tqdm's destructor raise the injected exception.
+                    progress = Mock()
+                    progress.close.side_effect = fail_cleanup
+                    stack.enter_context(patch.object(trainer, "tqdm", return_value=progress))
+                else:
+                    stack.enter_context(patch.object(TinyAccelerator, method, side_effect=fail_cleanup))
+                with self.assertRaisesRegex(RuntimeError, "synthetic cleanup failure"):
+                    self.run_mocked_loop()
+            report = json.loads(path.read_text())
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["cleanup_completed"])
+            self.assertTrue(report["optimizer_step_completed"])
+            self.assertTrue(report["step_checks_passed"])
+            self.assertEqual(report["failed_stage"], "cleanup")
+
+    def test_memory_query_failure_does_not_hide_original_exception(self):
+        args = self.args("--smoke_test", "--target_size", "32", "--optimizer", "adamw")
+        error = ValueError("original failure")
+        with patch.object(trainer, "_train", side_effect=error), \
+             patch.object(trainer.SmokeReport, "measure", side_effect=RuntimeError("CUDA query failed")):
+            with self.assertRaises(ValueError) as caught:
+                trainer.train(args)
+        self.assertIs(caught.exception, error)
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["exception_type"], "ValueError")
+        self.assertIn("CUDA query failed", report["memory_reporting_error"])
+
+    def test_unwritable_report_preserves_original_exception(self):
+        args = self.args("--smoke_test", "--target_size", "32", "--optimizer", "adamw")
+        error = PermissionError("output denied")
+        with patch.object(trainer.SmokeReport, "write", side_effect=error), \
+             patch.object(trainer, "_train") as run, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            with self.assertRaises(PermissionError) as caught:
+                trainer.train(args)
+        self.assertIs(caught.exception, error)
+        run.assert_not_called()
+        self.assertIn("Failed to write smoke diagnostics", stderr.getvalue())
 
     def test_mocked_smoke_fails_when_vae_buffer_changes(self):
         with self.assertRaisesRegex(RuntimeError, "frozen component changed"):

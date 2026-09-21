@@ -1,9 +1,11 @@
 torch>=2.3.0
+torchvision>=0.18.0
 diffusers>=0.37.0
-transformers>=4.45.0
+transformers>=4.51.3
 accelerate>=1.0.0
 peft>=0.10.0
 bitsandbytes>=0.43.0
 safetensors>=0.4.0
 pillow>=10.0.0
 tqdm
+# For the pinned standalone Base 9B smoke environment, use requirements-smoke.txt.
