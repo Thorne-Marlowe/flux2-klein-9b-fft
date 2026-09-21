@@ -24,6 +24,10 @@ BASE_CONFIG = {"_class_name": "Flux2KleinPipeline", "is_distilled": False,
 BASE_9B_ARCHITECTURE = {"num_layers": 8, "num_single_layers": 24,
                         "num_attention_heads": 32, "attention_head_dim": 128,
                         "joint_attention_dim": 12288, "in_channels": 128}
+OFFICIAL_BASE_INDEX = {key: value for key, value in BASE_CONFIG.items() if key != "is_distilled"}
+COMPLETE_9B_ARCHITECTURE = {**BASE_9B_ARCHITECTURE, "_class_name": "Flux2Transformer2DModel",
+                            "patch_size": 1, "guidance_embeds": False, "mlp_ratio": 3.0,
+                            "axes_dims_rope": [32, 32, 32, 32], "out_channels": None}
 
 
 @contextlib.contextmanager
@@ -184,6 +188,73 @@ class StandaloneTests(unittest.TestCase):
             with self.subTest(config=config), self.assertRaises(ValueError):
                 trainer.preflight_model_config(config)
 
+    def test_missing_distillation_flag_requires_selection_and_complete_architecture(self):
+        with self.assertRaisesRegex(ValueError, "--smoke_model_variant base-9b"):
+            trainer.preflight_model_config(OFFICIAL_BASE_INDEX, COMPLETE_9B_ARCHITECTURE)
+        trainer.preflight_model_config(OFFICIAL_BASE_INDEX, COMPLETE_9B_ARCHITECTURE,
+                                       smoke_model_variant="base-9b")
+        with self.assertRaisesRegex(ValueError, "complete Base 9B"):
+            trainer.preflight_model_config(OFFICIAL_BASE_INDEX, smoke_model_variant="base-9b")
+        for key in COMPLETE_9B_ARCHITECTURE.keys() - {"out_channels"}:
+            metadata = dict(COMPLETE_9B_ARCHITECTURE)
+            del metadata[key]
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                trainer.preflight_model_config(OFFICIAL_BASE_INDEX, metadata, smoke_model_variant="base-9b")
+
+    def test_selector_never_overrides_explicit_distillation_metadata(self):
+        for selection in (None, "base-9b"):
+            trainer.preflight_model_config(BASE_CONFIG, COMPLETE_9B_ARCHITECTURE,
+                                           smoke_model_variant=selection)
+            for field in ("is_distilled", "guidance_distilled", "timestep_distilled"):
+                for invalid in (True, None, "false", 0):
+                    for location in ("pipeline", "transformer"):
+                        pipeline, transformer = dict(BASE_CONFIG), dict(COMPLETE_9B_ARCHITECTURE)
+                        (pipeline if location == "pipeline" else transformer)[field] = invalid
+                        with self.subTest(selection=selection, field=field, invalid=invalid, location=location), \
+                             self.assertRaises(ValueError):
+                            trainer.preflight_model_config(pipeline, transformer, smoke_model_variant=selection)
+        trainer.preflight_model_config(OFFICIAL_BASE_INDEX,
+                                       {**COMPLETE_9B_ARCHITECTURE, "is_distilled": False},
+                                       smoke_model_variant="base-9b")
+
+    def test_selector_rejects_wrong_classes_and_architecture(self):
+        for overrides in ({"_class_name": "FluxPipeline"}, {"transformer": ["diffusers", "Other"]},
+                          {"transformer": ["custom", "Flux2Transformer2DModel"]}):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                trainer.preflight_model_config({**OFFICIAL_BASE_INDEX, **overrides},
+                                               COMPLETE_9B_ARCHITECTURE, smoke_model_variant="base-9b")
+        for overrides in ({"_class_name": "Other"}, {"num_layers": 5}, {"num_single_layers": 20},
+                          {"num_attention_heads": 24}, {"attention_head_dim": 64},
+                          {"joint_attention_dim": 7680}, {"in_channels": 64}, {"guidance_embeds": True},
+                          {"patch_size": 2}, {"mlp_ratio": 4.0}, {"axes_dims_rope": [16] * 4},
+                          {"out_channels": 64}):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                trainer.preflight_model_config(OFFICIAL_BASE_INDEX,
+                                               {**COMPLETE_9B_ARCHITECTURE, **overrides},
+                                               smoke_model_variant="base-9b")
+
+    def test_selector_rejects_known_conflicting_identities(self):
+        for identity in ("black-forest-labs/FLUX.2-klein-9B", "black-forest-labs/FLUX.2-klein-9B-kv",
+                         "black-forest-labs/FLUX.2-klein-base-4B",
+                         "C:\\cache\\models--black-forest-labs--FLUX.2-klein-9B\\snapshots\\hash"):
+            with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "Conflicting model identity"):
+                trainer.preflight_model_config(BASE_CONFIG, COMPLETE_9B_ARCHITECTURE,
+                                               smoke_model_variant="base-9b", model_path=identity)
+            for key in ("_name_or_path", "name_or_path", "repo_id", "base_model_name_or_path"):
+                for location in ("pipeline", "transformer"):
+                    pipeline, transformer = dict(OFFICIAL_BASE_INDEX), dict(COMPLETE_9B_ARCHITECTURE)
+                    (pipeline if location == "pipeline" else transformer)[key] = identity
+                    with self.subTest(key=key, location=location), self.assertRaises(ValueError):
+                        trainer.preflight_model_config(pipeline, transformer, smoke_model_variant="base-9b")
+
+    def test_model_variant_selector_is_smoke_only(self):
+        self.assertEqual(self.args("--smoke_test", "--smoke_model_variant", "base-9b").smoke_model_variant,
+                         "base-9b")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args("--smoke_model_variant", "base-9b")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args("--smoke_test", "--smoke_model_variant", "distilled")
+
     def test_component_width_preflight(self):
         pipe = self.tiny_pipe()
         trainer.preflight_components(pipe, 32)
@@ -327,22 +398,28 @@ class StandaloneTests(unittest.TestCase):
     def run_mocked_loop(self, *, failure=None, ordinary=False, mutate_buffer=False,
                         partial_update=False, invalid_metadata=False, no_update=False,
                         bad_clip=False, optimizer_name="adamw", rounded_updates=False,
-                        failure_type=torch.OutOfMemoryError, tracker=False):
-        pipe = self.tiny_pipe()
+                        failure_type=torch.OutOfMemoryError, tracker=False,
+                        missing_distilled=False, model_variant=None):
+        # Additional preflight cases must not change the BF16 fixture through test order.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            pipe = self.tiny_pipe()
         if rounded_updates:
             with torch.no_grad():
                 for p in pipe.transformer.parameters():
                     p.fill_(1.)
         pipe.vae.encode = Mock(wraps=pipe.vae.encode)
         pipeline = Mock()
-        pipeline.load_config.return_value = BASE_CONFIG
+        pipeline.load_config.return_value = OFFICIAL_BASE_INDEX if missing_distilled else BASE_CONFIG
         pipeline.from_pretrained.return_value = pipe
         pipeline._get_qwen3_prompt_embeds.return_value = torch.ones(1, 4, 6, dtype=torch.bfloat16)
         pipe._get_qwen3_prompt_embeds = pipeline._get_qwen3_prompt_embeds
         pipeline._prepare_latent_ids.return_value = torch.zeros(1, 4, 4)
         pipeline._prepare_text_ids.return_value = torch.zeros(1, 4, 4)
         transformer_class = Mock()
-        transformer_class.load_config.return_value = BASE_9B_ARCHITECTURE
+        transformer_class.load_config.return_value = COMPLETE_9B_ARCHITECTURE if missing_distilled else BASE_9B_ARCHITECTURE
+        if missing_distilled and model_variant is None:
+            pipeline.from_pretrained.side_effect = AssertionError("Missing selector must fail before weight loading")
         if invalid_metadata:
             transformer_class.load_config.return_value = {**BASE_9B_ARCHITECTURE, "num_layers": 5}
             pipeline.from_pretrained.side_effect = AssertionError("Must reject metadata before loading weights")
@@ -357,6 +434,7 @@ class StandaloneTests(unittest.TestCase):
                          "--sample_every", "2" if ordinary else "1")
         if tracker:
             args.log_dir = str(self.root / "logs")
+        args.smoke_model_variant = model_variant
         if ordinary:
             pipeline.load_config.side_effect = AssertionError("Ordinary training must not require optional metadata")
             pipe.transformer.save_pretrained.side_effect = None
@@ -430,6 +508,15 @@ class StandaloneTests(unittest.TestCase):
             trainer.train(args)
         return args, pipe, pipeline, transformer_class
 
+    def test_mocked_official_missing_flag_smoke_preflight(self):
+        with self.assertRaisesRegex(ValueError, "--smoke_model_variant base-9b"):
+            self.run_mocked_loop(missing_distilled=True)
+        self.run_mocked_loop(missing_distilled=True, model_variant="base-9b")
+        report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
+        self.assertTrue(report["passed"])
+        with self.assertRaisesRegex(ValueError, "requires Klein Base 9B"):
+            self.run_mocked_loop(missing_distilled=True, model_variant="base-9b", invalid_metadata=True)
+
     def test_mocked_one_step_smoke_loop(self):
         args, pipe, pipeline, transformer_class = self.run_mocked_loop()
         report = json.loads((self.root / "out" / "smoke_diagnostics.json").read_text())
@@ -438,7 +525,7 @@ class StandaloneTests(unittest.TestCase):
         self.assertTrue(report["cleanup_completed"])
         self.assertTrue(report["step_checks_passed"])
         self.assertEqual(report["optimizer_steps"], 1)
-        self.assertGreater(report["changed_sampled_values"], 0)
+        self.assertEqual(report["stored_weight_changes_observed"], report["changed_sampled_values"] > 0)
         self.assertEqual(report["peak_gpu_allocated_bytes"], 123)
         self.assertEqual(report["missing_gradients"], [])
         self.assertFalse(report["ema_enabled"])

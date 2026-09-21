@@ -254,18 +254,54 @@ def preflight_dataset(args):
     return dataset
 
 
-def preflight_model_config(config):
+def preflight_model_config(config, transformer_config=None, *, smoke_model_variant=None, model_path=None):
+    """Smoke-only identity checks; the selector declares identity, not weight provenance."""
     if config.get("_class_name") != "Flux2KleinPipeline":
         raise ValueError("Selected model must be a Flux2KleinPipeline")
-    if config.get("is_distilled") is not False:
-        raise ValueError("Selected model must explicitly declare is_distilled=false (Klein Base)")
+    if "is_distilled" in config and config["is_distilled"] is not False:
+        raise ValueError("Selected model must declare is_distilled=false when the field is present")
     transformer_entry = config.get("transformer")
     if (not isinstance(transformer_entry, (list, tuple)) or len(transformer_entry) != 2
-            or transformer_entry[-1] != "Flux2Transformer2DModel"):
+            or list(transformer_entry) != ["diffusers", "Flux2Transformer2DModel"]):
         raise ValueError("Selected model must use Flux2Transformer2DModel")
+    # Recognized conflicting identities veto even an explicit user declaration.
+    # Unknown local names are not evidence either for or against Base provenance.
+    conflicting_names = {"flux.2-klein-9b", "flux.2-klein-9b-kv", "flux.2-klein-4b",
+                         "flux.2-klein-base-4b", "flux.2-dev"}
+    identities = [model_path]
+    for metadata in (config, transformer_config or {}):
+        for key in ("is_distilled", "guidance_distilled", "timestep_distilled"):
+            if key in metadata and metadata[key] is not False:
+                raise ValueError(f"Conflicting model metadata: {key}={metadata[key]!r}")
+        identities.extend(metadata.get(key) for key in (
+            "_name_or_path", "name_or_path", "repo_id", "base_model_name_or_path"))
+    for identity in identities:
+        if isinstance(identity, (str, Path)):
+            parts = str(identity).lower().replace("\\", "/").split("/")
+            if any(part in conflicting_names or part in {
+                f"models--black-forest-labs--{name}" for name in conflicting_names
+            } for part in parts):
+                raise ValueError(f"Conflicting model identity: {identity}")
+    if transformer_config is not None:
+        preflight_9b_architecture(transformer_config)
+    if "is_distilled" not in config:
+        if smoke_model_variant != "base-9b":
+            raise ValueError("Missing is_distilled: smoke test requires --smoke_model_variant base-9b "
+                             "as a user declaration, not proof of weight provenance")
+        if transformer_config is None:
+            raise ValueError("Missing is_distilled requires complete Base 9B transformer metadata")
+        # Architecture alone cannot distinguish Base from distilled 9B. Require
+        # explicit selection AND all expected architecture fields for this fallback.
+        for key in ("_class_name", "patch_size", "guidance_embeds", "mlp_ratio", "axes_dims_rope"):
+            if key not in transformer_config:
+                raise ValueError(f"Missing is_distilled requires complete Base 9B metadata: {key}")
 
 
 def preflight_9b_architecture(config):
+    if "_class_name" in config and config["_class_name"] != "Flux2Transformer2DModel":
+        raise ValueError("Selected transformer must be Flux2Transformer2DModel")
+    if "is_distilled" in config and config["is_distilled"] is not False:
+        raise ValueError("Transformer is_distilled must be false when present")
     # BFL Klein9BParams, expressed using Diffusers config names:
     # https://github.com/black-forest-labs/flux2/blob/main/src/flux2/model.py
     expected = {"num_layers": 8, "num_single_layers": 24, "num_attention_heads": 32,
@@ -858,10 +894,10 @@ def _train(args, smoke):
     if args.smoke_test:
         from diffusers import Flux2Transformer2DModel
         model_config = Flux2KleinPipeline.load_config(args.model_path, **load_kwargs)
-        preflight_model_config(model_config)
         transformer_config = Flux2Transformer2DModel.load_config(
             args.model_path, subfolder="transformer", **load_kwargs)
-        preflight_9b_architecture(transformer_config)
+        preflight_model_config(model_config, transformer_config,
+                               smoke_model_variant=args.smoke_model_variant, model_path=args.model_path)
         smoke.data["architecture"] = dict(transformer_config)
 
     if is_main:
@@ -1314,6 +1350,9 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Flux2 Klein Standalone FFT")
     # Model
     parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--smoke_model_variant", choices=["base-9b"], default=None,
+                        help="Smoke-only user declaration of Base 9B identity when is_distilled is absent; "
+                             "not proof of weight provenance and never overrides conflicting metadata")
     parser.add_argument("--output_dir", type=str, required=True)
     # Data
     parser.add_argument("--data_dir", type=str, required=True)
@@ -1356,6 +1395,8 @@ def parse_args(argv=None):
         if args.model_path is None or args.target_size is None or args.optimizer is None:
             parser.error("--smoke_test requires explicit --model_path (Klein Base 9B), --target_size (e.g. 256), and --optimizer")
     else:
+        if args.smoke_model_variant is not None:
+            parser.error("--smoke_model_variant is only valid with --smoke_test")
         if args.model_path is None:
             args.model_path = "black-forest-labs/FLUX.2-klein-base-4B"
         if args.target_size is None:
