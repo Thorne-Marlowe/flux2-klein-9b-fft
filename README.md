@@ -1,5 +1,7 @@
 # Flux2 Klein Fine-tuning
 
+> ⚠️ **Fork notice:** This fork is developing a dedicated FLUX.2 Klein Base 9B full-weight training and recovery workflow. The original 4B setup examples below are retained from the upstream project and should not be treated as validated instructions for the fork's 9B recovery workflow. See 'Fork Development Status' for current validation results.
+
 First open-source Full Fine-tuning (FFT) implementation for **FLUX.2-klein-base-4B**.
 
 ## Features
@@ -105,7 +107,9 @@ The table below is preserved from the original README. Its support checkmarks an
 
 ## Fork Development Status
 
-This fork extends the standalone training script with a dedicated verification path for full-weight fine-tuning of FLUX.2 Klein Base 9B.
+This fork extends the original FLUX.2 Klein fine-tuning implementation with a dedicated verification and recovery path for **full-weight fine-tuning of FLUX.2 Klein Base 9B**.
+
+Development currently focuses on validating training execution, checkpoint publication, and numerical continuity across interrupted and resumed runs.
 
 ### Implemented
 
@@ -115,23 +119,49 @@ This fork extends the standalone training script with a dedicated verification p
 - Verification of transformer parameter coverage and frozen components.
 - Gradient, optimizer-state, precision, and GPU-memory diagnostics.
 - Optimizer-specific step verification for AdamW, Adafactor, and AdamW8bit.
+- Recovery checkpoint publication and fresh-process restoration.
+- Recovery metadata, configuration serialization, and checkpoint-shard handling.
 
 ### Validation status
 
-- 38 CPU tests passed as of Phase 2B.
-- AdamW and Adafactor exercised on CPU.
-- AdamW8bit verification tested using state fixtures; real CUDA behavior remains unverified.
-- Real Klein Base 9B forward, backward, and optimizer execution has not yet been validated.
+**Completed:**
 
-**Important:** This fork currently provides a preparation and diagnostic path for 9B full fine-tuning. Successful end-to-end 9B training has not yet been demonstrated.
+- 104 CPU recovery tests passed in the latest test run.
+- Real Klein Base 9B training executed on an NVIDIA A100 80GB GPU.
+- A four-step BF16 Adafactor experiment completed using two image-caption pairs.
+- An interrupted run published a checkpoint after step 2 and resumed in a fresh Python process to complete steps 3–4.
+- An uninterrupted control completed the same four-step configuration.
+- Both runs published their expected checkpoints without skipped steps.
 
-### Development changelog
+**Not yet qualified:**
+
+- Exact numerical equivalence between interrupted and uninterrupted training.
+- The trial and control model weights already differed at step 2, before the interruption.
+- The first source of divergence has not been identified.
+- Full training reliability beyond the short qualification experiment has not been established.
+- The minimum hardware requirements for this workflow have not been established.
+
+**Current conclusion:** Checkpoint publication and fresh-process restoration have been demonstrated. Exact numerical recovery remains unqualified.
+
+### Current investigation
+
+The next development task is to establish a reproducible baseline using two identical, uninterrupted training runs.
+
+The investigation will identify the first divergence in training inputs, random-number generation, model state, or optimizer updates before repeating the interrupted-versus-uninterrupted recovery comparison.
+
+Checkpoint restoration logic should not be changed solely on the basis of the existing mismatch.
+
+### Development history
 
 - **Phase 1 — Smoke-test preparation:** Added explicit EMA disabling, Base 9B preflight checks, full-transformer optimizer coverage, a fixed-size uncached one-pair path, and initial diagnostics and CPU tests.
-- **Phase 2A — Staged encoding and numerical diagnostics:** Encoded the image and caption before transformer GPU placement, returned frozen components to CPU, and added memory accounting, optimizer configuration/state reporting, seed and environment metadata, a bounded BF16/FP32 precision probe, and checks before and after gradient clipping.
-- **Phase 2B — Optimizer-step evidence:** Required initialized optimizer-specific state and step counters advancing exactly once. Added tests rejecting no-op or insufficient evidence while keeping observed BF16 weight changes separate from step verification.
+- **Phase 2A — Staged encoding and numerical diagnostics:** Added sequential component staging, memory accounting, optimizer reporting, seed and environment metadata, precision diagnostics, and gradient checks.
+- **Phase 2B — Optimizer-step evidence:** Added optimizer-specific state and step-counter verification.
+- **Recovery development:** Added checkpoint publication, restoration, continuity tests, and fixes for recovery metadata and serialization.
+- **Initial recovery qualification:** Demonstrated checkpoint publication and fresh-process restoration, but identified an unresolved numerical mismatch between trial and control runs.
 
-Git commits retain the detailed technical history. These phases cover the standalone verification path; they do not establish validated 9B training or extend the AI Toolkit integration.
+Git commits retain the detailed implementation history.
+
+This section describes the fork's standalone 9B verification and recovery work. It does not establish validation of the original AI Toolkit integration, multi-GPU training, or the complete training workflow.
 
 ## Key Differences from Flux1
 
