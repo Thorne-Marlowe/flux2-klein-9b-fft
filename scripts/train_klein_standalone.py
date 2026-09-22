@@ -188,10 +188,18 @@ def collate_fn(batch):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def encode_images_klein(vae, images, device, dtype):
+def encode_images_klein(vae, images, device, dtype, *, trace=None):
     """Encode images through Klein VAE with BatchNorm normalization."""
     images = images.to(device, dtype=dtype)
-    latents = vae.encode(images).latent_dist.sample()
+    if trace is None:
+        latents = vae.encode(images).latent_dist.sample()
+    else:
+        trace.emit("vae_input", tensors=[("images", images)], rng=True)
+        posterior = vae.encode(images).latent_dist
+        trace.emit("vae_posterior", tensors=[("mean", posterior.mean), ("std", posterior.std)], rng=True)
+        latents = posterior.sample()
+        trace.emit("vae_sample", tensors=[("latents", latents)], rng=True)
+        del posterior
 
     # Patchify: (B, C, H, W) -> (B, C*4, H/2, W/2)
     b, c, h, w = latents.shape
@@ -1383,6 +1391,8 @@ def parse_args(argv=None):
     parser.add_argument("--recovery_resume", help="Explicit complete v2 checkpoint root; no latest discovery or v1 migration")
     parser.add_argument("--recovery_model_variant", choices=["base-9b"], help="User Base 9B declaration when is_distilled is absent; not weight provenance")
     parser.add_argument("--recovery_stop_after", type=int, help="Stop and save at this absolute attempt without changing --steps (schedule horizon)")
+    parser.add_argument("--determinism_trace", help="Exclusive JSONL sidecar for a fresh recovery run; no backend changes or extra checkpoints")
+    parser.add_argument("--determinism_trace_steps", type=int, default=None, help="Observe first 1-4 attempts (default 2); requires --determinism_trace")
     # EMA
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--no_ema", dest="use_ema", action="store_false", help="Disable EMA shadow weights")
@@ -1402,6 +1412,13 @@ def parse_args(argv=None):
     parser.add_argument("--wandb_run_name", type=str, default=None)
 
     args = parser.parse_args(argv)
+    if args.determinism_trace_steps is not None and not args.determinism_trace:
+        parser.error("--determinism_trace_steps requires --determinism_trace")
+    if args.determinism_trace:
+        if not args.recovery or args.recovery_resume or args.smoke_test:
+            parser.error("--determinism_trace requires a fresh --recovery run, without resume or smoke")
+        if args.determinism_trace_steps is not None and not 1 <= args.determinism_trace_steps <= 4:
+            parser.error("--determinism_trace_steps must be in [1,4]")
     if args.recovery:
         if args.smoke_test or args.model_path is None or args.target_size is None or args.optimizer is None:
             parser.error("--recovery is separate from smoke and requires explicit --model_path, --target_size and --optimizer")

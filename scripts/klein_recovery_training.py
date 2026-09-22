@@ -246,7 +246,7 @@ class RecoverySession:
         ck.restore_rng_state(states["rng"], cuda_devices=1)
 
 
-def staged_batch(pipe, batch, device, trainer):
+def staged_batch(pipe, batch, device, trainer, *, trace=None):
     """Offload transformer during each uncached encoding; optimizer stays resident.
 
     This is intentionally slower than caching. Tensor identities are verified;
@@ -259,15 +259,23 @@ def staged_batch(pipe, batch, device, trainer):
     try:
         pipe.vae.to(device)
         with torch.no_grad():
-            latents = trainer.encode_images_klein(pipe.vae, batch["pixel_values"], device, torch.bfloat16)
+            if trace is None:
+                latents = trainer.encode_images_klein(pipe.vae, batch["pixel_values"], device, torch.bfloat16)
+            else:
+                latents = trainer.encode_images_klein(pipe.vae, batch["pixel_values"], device, torch.bfloat16, trace=trace)
+                trace.emit("vae_normalized", tensors=[("latents", latents)], rng=True)
     finally:
         pipe.vae.to("cpu")
         torch.cuda.empty_cache()
     try:
         pipe.text_encoder.to(device)
         with torch.no_grad():
+            if trace is not None:
+                trace.emit("text_encoding_begin", rng=True)
             embeds = pipe._get_qwen3_prompt_embeds(text_encoder=pipe.text_encoder, tokenizer=pipe.tokenizer,
                         prompt=batch["captions"], device=device, max_sequence_length=256, hidden_states_layers=(9, 18, 27))
+            if trace is not None:
+                trace.emit("text_encoding_end", tensors=[("embeddings", embeds)], rng=True)
     finally:
         pipe.text_encoder.to("cpu")
         torch.cuda.empty_cache()
@@ -277,20 +285,40 @@ def staged_batch(pipe, batch, device, trainer):
     return latents, embeds
 
 
-def flow_loss(model, latents, embeds, pipe, trainer):
+def flow_loss(model, latents, embeds, pipe, trainer, *, trace=None):
     device = latents.device
-    times = (torch.sigmoid(torch.randn(latents.shape[0], device=device)) * 1000).long().clamp(0, 999)
+    if trace is None:
+        times = (torch.sigmoid(torch.randn(latents.shape[0], device=device)) * 1000).long().clamp(0, 999)
+    else:
+        trace.emit("flow_begin", rng=True)
+        timestep_draw = torch.randn(latents.shape[0], device=device)
+        times = (torch.sigmoid(timestep_draw) * 1000).long().clamp(0, 999)
+        trace.emit("timestep", tensors=[("draw", timestep_draw), ("timesteps", times)], rng=True)
     sigmas = trainer.get_sigmas(times, n_dim=4, dtype=latents.dtype)
     noise = torch.randn_like(latents)
     noisy = (1 - sigmas) * latents + sigmas * noise
     patched = trainer.patchify(noisy)
-    prediction = model(hidden_states=trainer.pack_latents(patched), timestep=times.float() / 1000,
-                       guidance=None, encoder_hidden_states=embeds,
-                       txt_ids=pipe._prepare_text_ids(embeds).to(device),
-                       img_ids=pipe._prepare_latent_ids(patched).to(device), return_dict=False)[0]
+    if trace is None:
+        prediction = model(hidden_states=trainer.pack_latents(patched), timestep=times.float() / 1000,
+                           guidance=None, encoder_hidden_states=embeds,
+                           txt_ids=pipe._prepare_text_ids(embeds).to(device),
+                           img_ids=pipe._prepare_latent_ids(patched).to(device), return_dict=False)[0]
+    else:
+        packed = trainer.pack_latents(patched)
+        timestep = times.float() / 1000
+        txt_ids = pipe._prepare_text_ids(embeds).to(device)
+        img_ids = pipe._prepare_latent_ids(patched).to(device)
+        trace.emit("flow_inputs", tensors=[("noise", noise), ("sigmas", sigmas),
+                   ("noisy_latents", noisy), ("packed", packed), ("timestep", timestep),
+                   ("text_ids", txt_ids), ("image_ids", img_ids)], rng=True)
+        prediction = model(hidden_states=packed, timestep=timestep, guidance=None,
+                           encoder_hidden_states=embeds, txt_ids=txt_ids, img_ids=img_ids, return_dict=False)[0]
     prediction = trainer.unpack_latents(prediction, noisy.shape[2] // 2, noisy.shape[3] // 2)
     prediction = trainer.unpatchify(prediction, channels=latents.shape[1])
-    return torch.nn.functional.mse_loss(prediction.float(), (noise - latents).float())
+    loss = torch.nn.functional.mse_loss(prediction.float(), (noise - latents).float())
+    if trace is not None:
+        trace.emit("forward", tensors=[("prediction", prediction), ("loss", loss)], rng=True)
+    return loss
 
 
 def train_recovery(args):
@@ -324,7 +352,16 @@ def train_recovery(args):
     if torch.cuda.device_count() != 1:
         raise ck.CheckpointValidationError("Expose exactly one CUDA device with CUDA_VISIBLE_DEVICES")
     seed_recovery(args.seed)
+    trace = None
+    if getattr(args, "determinism_trace", None):
+        from scripts.klein_determinism import DeterminismTrace, model_tensors, optimizer_observation
+        trace = DeterminismTrace(args.determinism_trace, getattr(args, "determinism_trace_steps", None) or 2)
+        trace.emit("seeded", details={"seed": args.seed}, rng=True)
     pipe = load_selected_pipeline(args.model_path, files, torch.bfloat16)
+    if trace is not None:
+        trace.emit("loaded_cpu", tensors=[(component + "/" + name, value)
+                   for component in ("transformer", "vae", "text_encoder")
+                   for name, value in model_tensors(getattr(pipe, component))], full_cpu=True, rng=True)
     # Verify immutable input selection across loading before any training.
     if fingerprints["model"] != md.fingerprint_model(args.model_path, files):
         raise ck.CheckpointValidationError("Model files changed while loading")
@@ -353,12 +390,22 @@ def train_recovery(args):
         resolved_model_files=files, bucket_sizes=BUCKET_SIZES, ema=ema)
     metadata["document"]["fingerprints"]["source_code"] = fingerprints["source_code"]
     metadata["sha256"] = md.canonical_sha256(metadata["document"])
+    if trace is not None:
+        from scripts import klein_determinism
+        trace.emit("configuration", details={"metadata": metadata,
+                   "diagnostic_source_sha256": hashlib.sha256(Path(klein_determinism.__file__).read_bytes()).hexdigest(),
+                   "gpu_name": torch.cuda.get_device_name(accelerator.device),
+                   "gpu_capability": list(torch.cuda.get_device_capability(accelerator.device)),
+                   "save_every": args.save_every, "stop_after": args.recovery_stop_after,
+                   "optimizer": optimizer_observation(transformer, native_optimizer)}, rng=True, data=data)
     if checkpoint:
         md.validate_metadata_compatibility(ck._plain(checkpoint.manifest)["metadata"], metadata)
     # No Accelerate scheduler/loader wrappers: single-process native scheduler
     # explicitly follows the wrapper's skip policy, and loader stays on CPU.
     prepared_model, prepared_optimizer = accelerator.prepare(transformer, native_optimizer)
     transformer = accelerator.unwrap_model(prepared_model)
+    if trace is not None:
+        trace.emit("prepared", tensors=model_tensors(transformer), probe_only=True, rng=True, data=data)
     if ema:
         ema.shadow = {name: value.to(accelerator.device) for name, value in ema.shadow.items()}
     session = RecoverySession(transformer, native_optimizer, scheduler, ema, accelerator, data, metadata)
@@ -367,40 +414,81 @@ def train_recovery(args):
         session.restore(checkpoint)
     else:
         data.initialize_iterator()
+    if trace is not None:
+        trace.emit("iterator_ready", rng=True, data=data)
     limit = args.recovery_stop_after or args.steps
     if session.attempts > limit:
         raise ck.CheckpointCompatibilityError("Checkpoint is beyond recovery_stop_after; refusing a misleading stopped-run result")
     last_saved = None
     while session.attempts < limit:
+        observe = trace if trace is not None and session.attempts < trace.steps else None
+        if observe is not None:
+            observe.attempt = session.attempts
+            observe.emit("batch_begin", rng=True, data=data)
         batch = data.next()
-        latents, embeds = staged_batch(pipe, batch, accelerator.device, trainer)
+        if observe is None:
+            latents, embeds = staged_batch(pipe, batch, accelerator.device, trainer)
+        else:
+            observe.emit("batch", tensors=[("pixels", batch["pixel_values"])], full_cpu=True,
+                details={"samples": [Path(p).relative_to(dataset.data_dir).as_posix() for p in batch["paths"]],
+                         "caption_sha256": [hashlib.sha256(c.encode("utf-8")).hexdigest() for c in batch["captions"]]},
+                rng=True, data=data)
+            latents, embeds = staged_batch(pipe, batch, accelerator.device, trainer, trace=observe)
         trainer.parameter_coverage(transformer, native_optimizer)
         with accelerator.accumulate(prepared_model):
             with accelerator.autocast():
-                loss = flow_loss(prepared_model, latents, embeds, pipe, trainer)
+                if observe is None:
+                    loss = flow_loss(prepared_model, latents, embeds, pipe, trainer)
+                else:
+                    loss = flow_loss(prepared_model, latents, embeds, pipe, trainer, trace=observe)
             if not torch.isfinite(loss).item():
                 raise RuntimeError("Non-finite recovery loss; no checkpoint boundary")
             accelerator.backward(loss)
+            if observe is not None:
+                observe.emit("gradients_before_clip", tensors=model_tensors(transformer, gradients=True), probe_only=True, rng=True)
             accelerator.clip_grad_norm_(prepared_model.parameters(), args.max_grad_norm)
+            if observe is not None:
+                observe.emit("gradients_after_clip", tensors=model_tensors(transformer, gradients=True), probe_only=True,
+                             details={"lr_used": [g["lr"] for g in native_optimizer.param_groups]})
             before = trainer.optimizer_step_snapshot(transformer, native_optimizer, args.optimizer)
             prepared_optimizer.step()
             skipped = accelerator.optimizer_step_was_skipped
             evidence = trainer.verify_optimizer_step(before,
                 trainer.optimizer_step_snapshot(transformer, native_optimizer, args.optimizer), skipped)
+            if observe is not None:
+                observe.emit("optimizer_result", tensors=model_tensors(transformer), probe_only=True,
+                    details={"skipped": skipped, "evidence": evidence,
+                             "optimizer": optimizer_observation(transformer, native_optimizer)}, rng=True)
             session.acknowledge(skipped=skipped, evidence=evidence, loss=float(loss.item()))
+            if observe is not None:
+                observe.emit("acknowledged", tensors=list(ema.shadow.items()) if ema is not None else (),
+                    probe_only=True, details={"progress": session.progress(),
+                    "scheduler": scheduler.state_dict(), "lr_next": [g["lr"] for g in native_optimizer.param_groups]},
+                    rng=True, data=data)
         del loss, latents, embeds, batch
         if session.attempts % args.log_every == 0:
             print(f"Recovery attempt {session.attempts}: completed={session.completed}, skipped={session.skipped}, lr={native_optimizer.param_groups[0]['lr']}")
         if session.attempts % args.save_every == 0 or session.attempts == limit:
             destination = Path(args.output_dir) / f"checkpoint-{session.attempts}"
+            if observe is not None:
+                observe.emit("before_save", rng=True, data=data)
             session.save(destination)  # Any failure is fatal; no fallback export.
+            if observe is not None:
+                observe.emit("after_save", rng=True, data=data)
             last_saved = destination
             print(f"Published unqualified recovery checkpoint: {destination}")
     accelerator.wait_for_everyone()
     print(f"Recovery run stopped at attempt {session.attempts}; checkpoint={last_saved or args.recovery_resume}; exact recovery remains unqualified")
+    if trace is not None:
+        trace.finish()
 
 
 def validate_controls(args):
+    if getattr(args, "determinism_trace", None) and (args.recovery_resume or args.smoke_test):
+        raise ck.CheckpointValidationError("Determinism trace supports only fresh, uninterrupted recovery runs")
+    trace_steps = getattr(args, "determinism_trace_steps", None)
+    if trace_steps is not None and (not getattr(args, "determinism_trace", None) or not 1 <= trace_steps <= 4):
+        raise ck.CheckpointValidationError("Trace steps require --determinism_trace and must be in [1,4]")
     required = {"batch_size": 1, "grad_accum": 1, "num_workers": 0,
                 "use_cached_latents": False, "smoke_test": False, "wandb": False}
     for key, value in required.items():
