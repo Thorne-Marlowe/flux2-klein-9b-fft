@@ -105,9 +105,10 @@ class AcknowledgedData:
 
 def preallocation_check(args, dataset, files, checkpoint):
     """Check available identities/settings before pipeline allocation; objects later."""
+    from scripts.train_klein_standalone import BUCKET_SIZES
     fingerprints = {"model": md.fingerprint_model(args.model_path, files),
                     "dataset": md.fingerprint_dataset(dataset),
-                    "preprocessing": md.fingerprint_preprocessing(dataset, bucket_sizes=[]),
+                    "preprocessing": md.fingerprint_preprocessing(dataset, bucket_sizes=BUCKET_SIZES),
                     "source_code": md.fingerprint_source_code(Path(__file__).resolve().parents[1], RECOVERY_SOURCES)}
     if checkpoint is None:
         return fingerprints
@@ -217,7 +218,7 @@ class RecoverySession:
                   "rng": ck.capture_rng_state(cuda_devices=1)}
         result = ck.publish_checkpoint(destination, manifest=manifest, states=states, model=self.model,
                                        optimizer=self.optimizer, scheduler=self.scheduler, ema=self.ema,
-                                       fault_injector=fault_injector)
+                                       max_shard_bytes=512 * 1024**2, fault_injector=fault_injector)
         self.parent = manifest["checkpoint_id"]
         return result
 
@@ -293,6 +294,7 @@ def flow_loss(model, latents, embeds, pipe, trainer):
 
 
 def train_recovery(args):
+    from scripts.train_klein_standalone import BUCKET_SIZES
     from scripts import train_klein_standalone as trainer
     from scripts.klein_model_resolver import resolve_model_files, load_selected_pipeline
     from accelerate import Accelerator
@@ -348,7 +350,7 @@ def train_recovery(args):
     ema = trainer.EMAModel(transformer, args.ema_decay) if args.use_ema else None
     metadata = md.build_recovery_configuration(args=args, dataset=dataset, dataloader=data.loader,
         model=transformer, optimizer=native_optimizer, scheduler=scheduler, accelerator=accelerator,
-        resolved_model_files=files, bucket_sizes=[], ema=ema)
+        resolved_model_files=files, bucket_sizes=BUCKET_SIZES, ema=ema)
     metadata["document"]["fingerprints"]["source_code"] = fingerprints["source_code"]
     metadata["sha256"] = md.canonical_sha256(metadata["document"])
     if checkpoint:

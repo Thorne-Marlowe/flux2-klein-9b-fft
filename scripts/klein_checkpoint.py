@@ -1302,13 +1302,18 @@ def _restore_tensors(directory, tensors, stem, allowed_extra=(), *, validate_onl
         raise CheckpointValidationError(f"Tensor restoration failed: {error}") from error
 
 
+def _config_json_default(value):
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Unsupported model config value: {type(value).__name__}")
+
 def write_model_state(directory, model, *, max_shard_bytes=256 * 1024**2, before_write=None):
     """One raw model copy on disk, bounded CPU shards, no inference export."""
     # Diffusers config is a FrozenDict/Mapping, not a Transformers PretrainedConfig.
     config = getattr(model, "config", {})
     config = dict(config) if isinstance(config, Mapping) else config.to_dict()
     config = dict(config, _class_name=type(model).__name__)
-    encoded_config = json.dumps(config, allow_nan=False, sort_keys=True)
+    encoded_config = json.dumps(config, allow_nan=False, sort_keys=True, default=_config_json_default)
     files = _write_tensors(directory, _model_tensors(model), "diffusion_pytorch_model", max_shard_bytes,
                            before_write=before_write)
     path = Path(directory) / "config.json"
