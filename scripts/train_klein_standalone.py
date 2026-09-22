@@ -822,6 +822,9 @@ def generate_sample(pipeline, prompt, output_path, steps=25, guidance=3.5):
 # ---------------------------------------------------------------------------
 
 def train(args):
+    if getattr(args, "deterministic_recovery", False) and (
+            not getattr(args, "recovery", False) or getattr(args, "smoke_test", False)):
+        raise ValueError("--deterministic_recovery requires recovery training, not legacy or smoke mode")
     if getattr(args, "recovery", False):
         # Direct script execution must resolve the repository's helper package.
         root = str(Path(__file__).resolve().parents[1])
@@ -1388,6 +1391,8 @@ def parse_args(argv=None):
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint dir to resume from")
     parser.add_argument("--recovery", action="store_true", help="Opt-in unqualified v2 checkpoint training; single GPU, uncached fixed-size data, batch/accumulation 1, workers 0, no sampling/trackers")
+    parser.add_argument("--deterministic_recovery", action="store_true",
+                        help="Recovery-only strict deterministic PyTorch algorithms; requires launch-time CUBLAS_WORKSPACE_CONFIG=:4096:8; unsupported operations fail")
     parser.add_argument("--recovery_resume", help="Explicit complete v2 checkpoint root; no latest discovery or v1 migration")
     parser.add_argument("--recovery_model_variant", choices=["base-9b"], help="User Base 9B declaration when is_distilled is absent; not weight provenance")
     parser.add_argument("--recovery_stop_after", type=int, help="Stop and save at this absolute attempt without changing --steps (schedule horizon)")
@@ -1412,6 +1417,8 @@ def parse_args(argv=None):
     parser.add_argument("--wandb_run_name", type=str, default=None)
 
     args = parser.parse_args(argv)
+    if args.deterministic_recovery and (not args.recovery or args.smoke_test):
+        parser.error("--deterministic_recovery requires recovery training, not legacy or smoke mode")
     if args.determinism_trace_steps is not None and not args.determinism_trace:
         parser.error("--determinism_trace_steps requires --determinism_trace")
     if args.determinism_trace:

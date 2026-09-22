@@ -59,3 +59,38 @@ No telemetry service, GPU experiment or automatic mismatch repair is involved.
 Use the same code/dependencies and normal checkpoint cadence for both runs.
 Source identity changes with instrumentation: generate fresh baselines; do not
 relax recovery compatibility checks to reuse older checkpoints.
+
+## Opt-in strict deterministic recovery
+
+For the next two-fresh-run investigation, set the cuBLAS workspace environment
+**before starting each Python process**, and append `--deterministic_recovery`
+to both otherwise identical recovery commands, alongside the trace flags:
+
+```bash
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+# Append to each existing fresh --recovery command:
+# --deterministic_recovery --determinism_trace /LOCAL/run-a/trace.jsonl --determinism_trace_steps 2
+# Use a separate run-b output directory and trace path for the second run.
+```
+
+The flag enables `torch.use_deterministic_algorithms(True, warn_only=False)`
+and disables cuDNN benchmarking before Accelerator/model initialization.
+Missing or different workspace values and already-initialized CUDA contexts
+are rejected; no late environment assignment or warning-only fallback occurs.
+Unsupported deterministic operations raise explicitly, potentially before a
+gradient observation. A failed run's trace is incomplete, not evidence of a
+successful comparison. Record the error and last observation before proceeding.
+
+The seeded trace records the opt-in and effective strict settings; the existing
+configuration observation records the full backend settings (including TF32,
+SDPA, attention processors and cuBLAS workspace). Precision, optimizer, RNG
+draws and training schedule are unchanged. Without this flag the diagnostic
+continues to observe the existing backend settings without changing them.
+The flag is recovery-only; the trace still requires fresh runs. Existing strict
+checkpoint compatibility checks remain unchanged. Settings are process-wide,
+so use fresh processes rather than reusing an interpreter between experiments.
+
+These settings do not guarantee exact reproducibility across devices, library
+versions or all operations. Differing sampled pre-clipping gradients at attempt
+0 do not establish BF16, Adafactor or restoration as the cause. This experiment
+investigates the first observed difference; it does not establish a fix.

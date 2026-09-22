@@ -321,7 +321,33 @@ def flow_loss(model, latents, embeds, pipe, trainer, *, trace=None):
     return loss
 
 
+def configure_deterministic_recovery(args):
+    """Explicit process-wide opt-in, before imports/preparation can touch CUDA.
+
+    Do not guess whether cuBLAS read an environment value in an already-live
+    CUDA context. Require a fresh process and a launch-time workspace setting.
+    No precision, attention backend, RNG or warn-only fallback changes.
+    """
+    if not getattr(args, "deterministic_recovery", False):
+        return None
+    if not getattr(args, "recovery", False) or getattr(args, "smoke_test", False):
+        raise ck.CheckpointValidationError("--deterministic_recovery requires recovery training, not legacy or smoke mode")
+    instruction = "Launch a fresh Python process with CUBLAS_WORKSPACE_CONFIG=:4096:8 set before launch."
+    if torch.cuda.is_initialized():
+        raise ck.CheckpointValidationError("Strict recovery cannot start after CUDA initialization. " + instruction)
+    if os.environ.get("CUBLAS_WORKSPACE_CONFIG") != ":4096:8":
+        raise ck.CheckpointValidationError("--deterministic_recovery requires CUBLAS_WORKSPACE_CONFIG=:4096:8. " + instruction)
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    torch.backends.cudnn.benchmark = False
+    return {"requested": True,
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "deterministic_warn_only": torch.is_deterministic_algorithms_warn_only_enabled(),
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "CUBLAS_WORKSPACE_CONFIG": os.environ["CUBLAS_WORKSPACE_CONFIG"]}
+
+
 def train_recovery(args):
+    strict_settings = configure_deterministic_recovery(args)
     from scripts.train_klein_standalone import BUCKET_SIZES
     from scripts import train_klein_standalone as trainer
     from scripts.klein_model_resolver import resolve_model_files, load_selected_pipeline
@@ -356,7 +382,10 @@ def train_recovery(args):
     if getattr(args, "determinism_trace", None):
         from scripts.klein_determinism import DeterminismTrace, model_tensors, optimizer_observation
         trace = DeterminismTrace(args.determinism_trace, getattr(args, "determinism_trace_steps", None) or 2)
-        trace.emit("seeded", details={"seed": args.seed}, rng=True)
+        details = {"seed": args.seed}
+        if strict_settings is not None:
+            details["deterministic_recovery"] = strict_settings
+        trace.emit("seeded", details=details, rng=True)
     pipe = load_selected_pipeline(args.model_path, files, torch.bfloat16)
     if trace is not None:
         trace.emit("loaded_cpu", tensors=[(component + "/" + name, value)
