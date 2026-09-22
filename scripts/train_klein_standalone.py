@@ -814,6 +814,13 @@ def generate_sample(pipeline, prompt, output_path, steps=25, guidance=3.5):
 # ---------------------------------------------------------------------------
 
 def train(args):
+    if getattr(args, "recovery", False):
+        # Direct script execution must resolve the repository's helper package.
+        root = str(Path(__file__).resolve().parents[1])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from scripts.klein_recovery_training import train_recovery
+        return train_recovery(args)
     smoke = SmokeReport(args) if args.smoke_test else None
     try:
         if smoke is not None:
@@ -1367,11 +1374,15 @@ def parse_args(argv=None):
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--optimizer", type=str, default=None, choices=["adamw", "adamw8bit", "adafactor"], help="Required explicitly for smoke tests; ordinary training defaults to adamw8bit")
-    parser.add_argument("--seed", type=int, default=0, help="Smoke-test random seed (ordinary training unchanged)")
+    parser.add_argument("--seed", type=int, default=0, help="Smoke/recovery random seed (legacy training unchanged)")
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint dir to resume from")
+    parser.add_argument("--recovery", action="store_true", help="Opt-in unqualified v2 checkpoint training; single GPU, uncached fixed-size data, batch/accumulation 1, workers 0, no sampling/trackers")
+    parser.add_argument("--recovery_resume", help="Explicit complete v2 checkpoint root; no latest discovery or v1 migration")
+    parser.add_argument("--recovery_model_variant", choices=["base-9b"], help="User Base 9B declaration when is_distilled is absent; not weight provenance")
+    parser.add_argument("--recovery_stop_after", type=int, help="Stop and save at this absolute attempt without changing --steps (schedule horizon)")
     # EMA
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--no_ema", dest="use_ema", action="store_false", help="Disable EMA shadow weights")
@@ -1391,6 +1402,11 @@ def parse_args(argv=None):
     parser.add_argument("--wandb_run_name", type=str, default=None)
 
     args = parser.parse_args(argv)
+    if args.recovery:
+        if args.smoke_test or args.model_path is None or args.target_size is None or args.optimizer is None:
+            parser.error("--recovery is separate from smoke and requires explicit --model_path, --target_size and --optimizer")
+    elif any(value is not None for value in (args.recovery_resume, args.recovery_model_variant, args.recovery_stop_after)):
+        parser.error("--recovery_resume, --recovery_model_variant and --recovery_stop_after require --recovery")
     if args.smoke_test:
         if args.model_path is None or args.target_size is None or args.optimizer is None:
             parser.error("--smoke_test requires explicit --model_path (Klein Base 9B), --target_size (e.g. 256), and --optimizer")
