@@ -152,7 +152,10 @@ Consult each model's own terms; this table does not grant rights to model weight
 
 ## License information
 
-The upstream README described the code as Apache 2.0. This checkout does not
-include a `LICENSE` file, so that statement should not be read as a newly supplied
-license grant. Model weights have separate terms; the 4B model's license does not
-establish the Base 9B model's license. This fork does not alter those terms.
+This repository contains training code and does not redistribute FLUX.2 [klein] Base 9B model weights.
+
+The licensing of this repository's code and the licensing of model weights are separate matters. FLUX.2 [klein] 4B and 4B Base are published by Black Forest Labs under Apache 2.0, while FLUX.2 [klein] 9B and 9B Base are published under the FLUX Non-Commercial License.
+
+This fork targets FLUX.2 [klein] Base 9B. Downloading, using, fine-tuning, or distributing that model or derivatives remains subject to the applicable Black Forest Labs model license. This fork does not modify, replace, or grant additional rights under those terms.
+
+No FLUX.2 [klein] Base 9B model weights are included in this repository.
