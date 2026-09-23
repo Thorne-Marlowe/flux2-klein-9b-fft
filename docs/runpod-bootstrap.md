@@ -53,12 +53,39 @@ python3.12 /workspace/flux2-klein-9b-fft/scripts/bootstrap_runpod.py setup \
 All paths are configurable. The output is an empty parent reserved for future
 `run-a` and `run-b` directories, not a training invocation. Keep it separate
 from the checkout/model/data/environment. Setup creates a venv only if absent
-and installs `requirements-smoke.txt` only into that new venv. An existing
-environment is reused only after verifying every applicable locked version
-and `pip check`; mismatches are not automatically upgraded. Choose a new venv
-path if an installation was interrupted or existing versions differ. The lock
+and applies `requirements-smoke.txt` to that isolated venv on every `setup`,
+including after an interrupted installation. Pip reuses satisfied versions and
+cached artifacts; no force-reinstall, cache purge or automatic venv deletion is
+performed. Setup reconciles missing/different versions with the same lock,
+then verifies every applicable version and `pip check`. Preflight never installs
+or repairs packages. If the venv is damaged and has no Python executable, inspect
+it manually or choose a new path. The lock
 explicitly requires `torch==2.10.0+cu128` and `torchvision==0.25.0+cu128`, so CPU
 builds cannot satisfy it. This is a version lock, not an artifact-hash lock.
+
+Stage transitions and elapsed-time heartbeats are flushed immediately (default
+every 15 seconds), even when pip produces no output. Only translated pip events
+such as resolving a locked package, downloading an artifact or reusing cache
+are streamed; raw errors, URLs and arbitrary subprocess output remain hidden.
+A quiet heartbeat is **not** a diagnosis of a stalled download. Pip's socket
+inactivity timeout detects network silence separately from the time taken to
+download a large wheel or install packages.
+
+Optional setup controls:
+
+```text
+--pip-timeout 120 --pip-retries 3 --pip-max-seconds 21600 --progress-interval 15
+```
+
+These are the defaults: 120-second socket inactivity timeout, three connection
+retries (allowed 0–10), and a six-hour total pip runtime budget. Set the total
+budget to `0` to disable it, or increase it for a slow connection. The total
+budget is not an inactivity detector. There is no automatic whole-install retry
+loop. Failures and interrupts report the stage, elapsed time and recovery steps;
+rerun the same setup command to reuse the existing environment and caches.
+Bootstrap never removes partial downloads, although pip's own partial-download
+retention/resumption depends on its version; completed cache entries and installed
+packages are reusable. No dependency installations occur during preflight.
 
 Setup validates credentials and gated repository access before requesting model
 payloads. `--model-revision` defaults to `main`, resolved once to an immutable

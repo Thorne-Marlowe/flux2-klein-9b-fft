@@ -4,6 +4,9 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -141,7 +144,7 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(b.BootstrapError, "exactly two"):
             b.validate_dataset(self.root, 32)
 
-    def invoke_main(self, mode="preflight", output=None, model_error=None):
+    def invoke_main(self, mode="preflight", output=None, model_error=None, install_error=None, extra=()):
         repo = Path(b.__file__).resolve().parents[1]
         venv = self.root / "env"
         (venv / "bin").mkdir(parents=True, exist_ok=True)
@@ -149,6 +152,7 @@ class BootstrapTests(unittest.TestCase):
         arguments = [mode, "--workspace", str(self.root), "--repo", str(repo),
                      "--commit", "a" * 40, "--venv", str(venv), "--model", str(self.root / "model"),
                      "--dataset", str(self.root / "data"), "--output", str(output or self.root / "outputs")]
+        arguments.extend(extra)
         stream = io.StringIO()
         with contextlib.ExitStack() as stack:
             for name, result in (("verify_git", {"commit": "a" * 40}), ("dependency_versions", {}),
@@ -156,6 +160,7 @@ class BootstrapTests(unittest.TestCase):
                 stack.enter_context(patch.object(b, name, return_value=result))
             stack.enter_context(patch.object(b, "validate_model", return_value={}, side_effect=model_error))
             downloader = stack.enter_context(patch.object(b, "download_missing", return_value={}))
+            self.installer = stack.enter_context(patch.object(b, "install_dependencies", side_effect=install_error))
             runner = stack.enter_context(patch.object(b, "run", return_value=""))
             stack.enter_context(patch.object(b.platform, "system", return_value="Linux"))
             stack.enter_context(patch.object(b.platform, "machine", return_value="x86_64"))
@@ -171,6 +176,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertIn("environment_ready", output)
         download.assert_not_called()
+        self.installer.assert_not_called()
         self.assertFalse((self.root / "outputs").exists())
         self.assertEqual(runner.call_count, 1)
         self.assertEqual(runner.call_args.args[0][-2:], ["pip", "check"])
@@ -190,6 +196,144 @@ class BootstrapTests(unittest.TestCase):
         self.assertNotIn("environment_ready", output)
         self.assertNotIn("fake-secret", output)
         download.assert_not_called()
+
+    def test_progress_heartbeat_visible_without_output_and_through_hub_suppression(self):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            progress = b.Progress(interval=0.01)
+            progress.start("Hugging Face access")
+            try:
+                with b.quiet_hub():
+                    print("fake-secret")
+                    time.sleep(0.04)
+                progress.start("model download")
+            finally:
+                progress.close()
+        output = stream.getvalue()
+        self.assertIn("Hugging Face access +", output)
+        self.assertIn("still running", output)
+        self.assertIn("completed", output)
+        self.assertIn("model download", output)
+        self.assertNotIn("fake-secret", output)
+
+    def test_safe_pip_events_never_forward_arbitrary_text(self):
+        for line in ("Authorization: Bearer fake-secret", "HF_TOKEN=fake-secret", "ERROR: fake-secret"):
+            self.assertIsNone(b.safe_pip_event(line, {"torch"}))
+        for line in ("Collecting torch==2 (from https://fake-secret@example.invalid)",
+                     "Downloading https://fake-secret@example.invalid/artifact.whl",
+                     "Using cached fake-secret", "WARNING: Retrying fake-secret",
+                     "WARNING: ReadTimeoutError('fake-secret')"):
+            event = b.safe_pip_event(line, {"torch"})
+            self.assertIsNotNone(event)
+            self.assertNotIn("fake-secret", event)
+        self.assertIsNone(b.safe_pip_event("Collecting fake-secret", {"torch"}))
+        self.assertIn("network socket timeout", b.safe_pip_event("ReadTimeoutError", {"torch"}))
+
+    def pip_fixture(self, source, *, max_seconds=5):
+        """Run a tiny local Python child INSTEAD OF pip; no network or install."""
+        lock = self.root / "lock.txt"
+        lock.write_text("torch==2.10.0+cu128\n")
+        native_popen = subprocess.Popen
+        commands, children = [], []
+        def spawn(command, **kwargs):
+            commands.append(command)
+            child = native_popen([sys.executable, "-u", "-c", source], **kwargs)
+            children.append(child)
+            return child
+        stream = io.StringIO()
+        error = None
+        with contextlib.redirect_stdout(stream), patch.object(b.subprocess, "Popen", side_effect=spawn):
+            progress = b.Progress(interval=0.01)
+            progress.start("dependency installation", "Rerun setup with the same venv; cached artifacts retained.")
+            try:
+                b.install_dependencies(Path(sys.executable), lock, progress, timeout=120, retries=3, max_seconds=max_seconds)
+            except b.BootstrapError as exc:
+                error = exc
+                progress.fail(str(exc))
+            finally:
+                progress.close()
+        self.assertTrue(all(p.poll() is not None for p in children))
+        return commands[0], stream.getvalue(), error
+
+    def test_streamed_safe_progress_and_quiet_slow_operation(self):
+        command, output, error = self.pip_fixture(
+            "import time; print('Collecting torch==2.10.0+cu128'); "
+            "print('Downloading https://fake-secret@example.invalid/wheel'); "
+            "print('Authorization: fake-secret'); time.sleep(0.15)")
+        self.assertIsNone(error)
+        self.assertIn("pip: resolving torch", output)
+        self.assertIn("pip: downloading artifact", output)
+        self.assertIn("quiet output alone is not evidence of a stall", output)
+        self.assertNotIn("fake-secret", output)
+        self.assertEqual(command[command.index("--timeout") + 1], "120")
+        self.assertEqual(command[command.index("--retries") + 1], "3")
+        self.assertNotIn("--force-reinstall", command)
+        self.assertNotIn("--upgrade", command)
+
+    def test_total_budget_terminates_silent_child_with_safe_recovery_message(self):
+        _, output, error = self.pip_fixture("import time; time.sleep(30)", max_seconds=0.05)
+        self.assertIsInstance(error, b.BootstrapError)
+        self.assertIn("total runtime budget", output)
+        self.assertIn("not proof of a network stall", output)
+        self.assertIn("Recovery: Rerun setup", output)
+        self.assertRegex(output, r"dependency installation \+\d+s.*FAILED")
+
+    def test_pip_nonzero_exit_is_safe_and_does_not_retry_whole_install(self):
+        _, output, error = self.pip_fixture("import sys; print('ERROR: fake-secret'); sys.exit(2)")
+        self.assertIsInstance(error, b.BootstrapError)
+        self.assertIn("exited with code 2", output)
+        self.assertNotIn("fake-secret", output)
+
+    def test_setup_can_retry_existing_environment_without_cleanup(self):
+        env = self.root / "env"
+        env.mkdir()
+        installed = env / "installed-marker"
+        installed.write_text("keep")
+        code, output, download, _ = self.invoke_main(mode="setup", install_error=b.BootstrapError("Pip exited with code 2"))
+        self.assertEqual(code, 1)
+        self.assertIn("dependency installation", output)
+        self.assertIn("FAILED", output)
+        self.assertIn("same venv", output)
+        self.assertNotIn("environment_ready", output)
+        download.assert_not_called()
+        code, output, _, runner = self.invoke_main(mode="setup")
+        self.assertEqual(code, 0, output)
+        self.installer.assert_called_once()
+        self.assertEqual(installed.read_text(), "keep")
+        self.assertEqual(runner.call_count, 1)  # pip check only; no venv recreation.
+        for stage in ("repository validation", "virtual environment setup", "dependency installation",
+                      "dependency verification", "dataset validation", "final model and output checks"):
+            self.assertIn(stage, output)
+
+    def test_interrupted_install_reports_stage_and_keeps_environment(self):
+        code, output, download, _ = self.invoke_main(mode="setup", install_error=KeyboardInterrupt())
+        self.assertEqual(code, 130)
+        self.assertIn("dependency installation", output)
+        self.assertIn("Interrupted", output)
+        self.assertIn("same venv", output)
+        self.assertNotIn("environment_ready", output)
+        self.assertTrue((self.root / "env/bin/python").exists())
+        download.assert_not_called()
+
+    def test_hub_access_and_download_have_separate_visible_stages(self):
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            progress = b.Progress()
+            try:
+                b.download_missing(self.root / "model", "main", hub=self.hub, progress=progress)
+            finally:
+                progress.close()
+        output = stream.getvalue()
+        self.assertIn("Hugging Face access", output)
+        self.assertIn("model download", output)
+        self.assertNotIn("fake-cached-secret", output)
+
+    def test_negative_retry_and_timeout_arguments_rejected_without_echo(self):
+        for option, value in (("--pip-retries", "-1"), ("--pip-retries", "11"),
+                              ("--pip-timeout", "0"), ("--pip-max-seconds", "-1"),
+                              ("--progress-interval", "0"), ("--pip-retries", "fake-secret")):
+            with self.subTest(option=option, value=value), self.assertRaises(SystemExit):
+                self.invoke_main(extra=[option, value])
 
     def test_accidental_cli_token_is_not_echoed(self):
         stream = io.StringIO()
