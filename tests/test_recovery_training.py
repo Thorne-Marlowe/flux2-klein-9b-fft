@@ -13,6 +13,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+import warnings
 from unittest.mock import patch
 
 import torch
@@ -246,6 +247,69 @@ def run_worker(root, mode, kind, boundary):
 
 
 class RecoveryIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(importlib.util.find_spec("accelerate"), "Accelerate is not installed")
+    def test_nonfinite_backward_stops_before_recovery_state_mutation(self):
+        for kind in ("adamw", "adafactor"):
+            for invalid in (float("nan"), float("inf"), -float("inf")):
+                with self.subTest(optimizer=kind, gradient=invalid), cpu_rng_fixture():
+                    session, model, optimizer = make_session(self.fixture, kind, real_accelerate=True)
+                    session.data.initialize_iterator()
+                    advance(session, 1)
+                    destination = self.root / f"previous-{kind}-{str(invalid)}"
+                    session.save(destination)
+                    previous = ck.validate_checkpoint(destination).manifest
+                    def snapshot():
+                        return copy.deepcopy({"model": model.state_dict(),
+                            "optimizer": session.optimizer.state_dict(),
+                            "scheduler": session.scheduler.state_dict(), "ema": session.ema.shadow,
+                            "progress": session.progress(), "cosine": session.cosine,
+                            "loss_sum": session.loss_sum, "log_steps": session.log_steps})
+                    before = snapshot()
+                    session.data.next()  # Yielding is not acknowledgement.
+                    handle = next(model.parameters()).register_hook(lambda g: torch.full_like(g, invalid))
+                    try:
+                        loss = model(torch.ones(1, 3, dtype=torch.bfloat16)).float().square().mean()
+                        self.assertTrue(torch.isfinite(loss).item())
+                        session.accelerator.backward(loss)
+                        with patch.object(optimizer, "step", wraps=optimizer.step) as step, \
+                             patch.object(session, "acknowledge", wraps=session.acknowledge) as acknowledge, \
+                             patch.object(session, "save", wraps=session.save) as save:
+                            with self.assertRaisesRegex(RuntimeError, "Non-finite recovery gradient norm"):
+                                recovery.clip_recovery_gradients(session.accelerator, model.parameters(), 1.0)
+                                optimizer.step()
+                                session.acknowledge(skipped=False, evidence={"sufficient": True}, loss=loss.item())
+                                session.save(self.root / "must-not-publish")
+                            step.assert_not_called()
+                            acknowledge.assert_not_called()
+                            save.assert_not_called()
+                        self.assertTrue(ck._equal_state(before, snapshot()))
+                        self.assertFalse((self.root / "must-not-publish").exists())
+                        self.assertEqual(previous, ck.validate_checkpoint(destination).manifest)
+                    finally:
+                        handle.remove()
+
+    @unittest.skipUnless(importlib.util.find_spec("accelerate"), "Accelerate is not installed")
+    def test_finite_clipping_matches_existing_accelerate_path(self):
+        from accelerate import Accelerator
+        accelerator = Accelerator(cpu=True)
+        for dtype in (torch.float32, torch.bfloat16):
+            original = torch.nn.Parameter(torch.ones(4, dtype=dtype))
+            checked = torch.nn.Parameter(original.detach().clone())
+            original.grad = torch.tensor([1., 2., 3., 4.], dtype=dtype)
+            checked.grad = original.grad.clone()
+            expected = accelerator.clip_grad_norm_([original], 1.0)
+            with patch.object(accelerator, "clip_grad_norm_", wraps=accelerator.clip_grad_norm_) as clip:
+                actual = recovery.clip_recovery_gradients(accelerator, [checked], 1.0)
+                clip.assert_called_once()
+            self.assertTrue(torch.equal(expected, actual))
+            self.assertTrue(torch.equal(original.grad, checked.grad))
+            left = torch.optim.AdamW([original], lr=3e-5, foreach=False)
+            right = torch.optim.AdamW([checked], lr=3e-5, foreach=False)
+            left.step()
+            right.step()
+            self.assertTrue(torch.equal(original, checked))
+            self.assertTrue(ck._equal_state(left.state_dict(), right.state_dict()))
+
     def setUp(self):
         self.fixture = fixtures.RecoveryMetadataTests()
         self.fixture.setUp()
@@ -445,7 +509,18 @@ class ResolverTests(unittest.TestCase):
             trainer.parse_args(base + ["--recovery_resume", "saved"])
         args = trainer.parse_args(base + ["--recovery", "--model_path", "local", "--target_size", "256",
             "--optimizer", "adafactor", "--batch_size", "1", "--grad_accum", "1", "--num_workers", "0", "--sample_prompts"])
-        recovery.validate_controls(args)
+        with self.assertWarnsRegex(UserWarning, "effective weight_decay=0"):
+            recovery.validate_controls(args)
+        args.weight_decay = 0.2
+        with self.assertWarnsRegex(UserWarning, "not applied"):
+            recovery.validate_controls(args)
+        self.assertEqual(args.weight_decay, 0.2)
+        for kind, decay in (("adafactor", 0), ("adamw", 0.2)):
+            args.optimizer, args.weight_decay = kind, decay
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                recovery.validate_controls(args)
+            self.assertEqual(caught, [])
 
 
 if __name__ == "__main__":

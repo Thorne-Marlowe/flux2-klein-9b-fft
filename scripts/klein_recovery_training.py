@@ -15,6 +15,7 @@ import platform
 import random
 import sys
 import uuid
+import warnings
 
 import torch
 from torch.utils.data import DataLoader, Sampler
@@ -346,6 +347,19 @@ def configure_deterministic_recovery(args):
             "CUBLAS_WORKSPACE_CONFIG": os.environ["CUBLAS_WORKSPACE_CONFIG"]}
 
 
+def clip_recovery_gradients(accelerator, parameters, max_norm):
+    """Reject invalid norms before updates, using the existing clipping reduction.
+
+    Accelerate 1.12 has no error_if_nonfinite keyword. Its single-device path
+    returns PyTorch's pre-clipping total norm; checking it adds no gradient scan.
+    Failed clipping may alter gradients, but no training state may be advanced.
+    """
+    norm = accelerator.clip_grad_norm_(parameters, max_norm)
+    if not torch.isfinite(norm).item():
+        raise RuntimeError("Non-finite recovery gradient norm; optimizer update and acknowledgement aborted")
+    return norm
+
+
 def train_recovery(args):
     strict_settings = configure_deterministic_recovery(args)
     from scripts.train_klein_standalone import BUCKET_SIZES
@@ -475,7 +489,7 @@ def train_recovery(args):
             accelerator.backward(loss)
             if observe is not None:
                 observe.emit("gradients_before_clip", tensors=model_tensors(transformer, gradients=True), probe_only=True, rng=True)
-            accelerator.clip_grad_norm_(prepared_model.parameters(), args.max_grad_norm)
+            clip_recovery_gradients(accelerator, prepared_model.parameters(), args.max_grad_norm)
             if observe is not None:
                 observe.emit("gradients_after_clip", tensors=model_tensors(transformer, gradients=True), probe_only=True,
                              details={"lr_used": [g["lr"] for g in native_optimizer.param_groups]})
@@ -540,6 +554,11 @@ def validate_controls(args):
             raise ck.CheckpointValidationError(f"Recovery {key} must be finite and positive")
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         raise ck.CheckpointValidationError("Recovery weight_decay must be finite and nonnegative")
+    if args.optimizer == "adafactor" and args.weight_decay != 0:
+        warnings.warn("Recovery Adafactor uses effective weight_decay=0; "
+                      f"requested --weight_decay {args.weight_decay} is not applied. "
+                      "Use --weight_decay 0 to acknowledge the existing policy.",
+                      UserWarning, stacklevel=2)
     if args.use_ema and (not math.isfinite(args.ema_decay) or not 0 <= args.ema_decay < 1):
         raise ck.CheckpointValidationError("Recovery EMA decay must be in [0,1)")
     for name in ("ACCELERATE_USE_FSDP", "ACCELERATE_USE_DEEPSPEED"):

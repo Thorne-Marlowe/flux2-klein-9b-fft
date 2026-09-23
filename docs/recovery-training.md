@@ -74,6 +74,27 @@ See the qualification record for the comparison contract and evidence gaps.
 
 ## Boundaries and limitations
 
+- Recovery Adafactor retains its existing **effective weight decay of zero**.
+  A nonzero `--weight_decay` (including the shared CLI default of 0.01) now
+  produces a warning because it is not applied. Specify `--weight_decay 0`
+  explicitly for Adafactor. AdamW applies the requested value. This clarification
+  does not change optimizer configuration or historical qualification results.
+- Effective warmup is `min(warmup_steps, steps // 10)`. The first attempt uses
+  `--lr`; after zero-based attempt `a` during warmup, the next LR is assigned
+  `lr * (a + 1) / effective_warmup`, including skipped attempts. After warmup,
+  native CosineAnnealingLR advances only on completed updates, with
+  `T_max = steps - effective_warmup` and `eta_min = lr * 0.1`. There is no
+  warmup division when effective warmup is zero. Resume restores native scheduler
+  state and actual group LRs without replaying warmup. This describes the existing
+  after-attempt policy; it is not conventional before-update linear warmup.
+- A nonfinite loss or clipping norm aborts before the optimizer update and
+  acknowledgement. The norm check reuses the existing clipping reduction;
+  failed clipping may mutate gradients, but optimizer, scheduler, EMA, acknowledged
+  cursor and completed-update count do not advance, and no checkpoint is published
+  for that attempt. Previously committed checkpoints remain available. Reading
+  the batch and backward may already have consumed RNG; this is a fatal failure,
+  not an in-process retry or RNG rollback.
+
 - The resolver selects standard safetensors, built-in Klein/Qwen classes and
   the fast tokenizer JSON. It rejects ambiguous weights, missing shards, custom
   code, quantization and unsupported tokenizer assets. Slow vocab/merges are
