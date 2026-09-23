@@ -1,100 +1,136 @@
-# Flux2 Klein Fine-tuning
+# FLUX.2 Klein fine-tuning: Base 9B recovery fork
 
-> ⚠️ **Fork notice:** This fork is developing a dedicated FLUX.2 Klein Base 9B full-weight training and recovery workflow. The original 4B setup examples below are retained from the upstream project and should not be treated as validated instructions for the fork's 9B recovery workflow. See 'Fork Development Status' for current validation results.
+This fork develops standalone **full-weight FLUX.2 Klein Base 9B training,
+diagnostics and checkpoint recovery** alongside the original 4B-oriented code.
+A recorded deterministic BF16 experiment reproduced the uninterrupted control's
+final model and recoverable state after explicit recovery from checkpoint-2.
+This is qualification of the recorded short configuration, not general exact
+reproducibility or production-training reliability.
 
-First open-source Full Fine-tuning (FFT) implementation for **FLUX.2-klein-base-4B**.
+> **Fork notice:** Original 4B examples and AI Toolkit integration are retained
+> as upstream material. They are not validated instructions for the fork's 9B
+> recovery path. See [Fork Development Status](#fork-development-status) and the
+> [qualification record](docs/qualification/deterministic-bf16-a100-2026-09-23.md).
 
-## Features
+## Standalone Base 9B workflow
 
-- **Full Fine-tuning** of Flux2 Klein-base 4B/9B transformer
-- **Batch Latent Caching** with multi-GPU support (dramatically faster than sequential)
-- **Multi-GPU Training** support via DDP
-- **ai-toolkit extension** (`klein2`) for easy integration
-- Supports both **tag captions** and **natural language captions**
-- Resolution bucketing (512~1024)
-- Gradient checkpointing + AdamW8bit / Adafactor optimizer
-- EMA smoothing
-- Sample generation during training
+- [Environment bootstrap](docs/runpod-bootstrap.md): isolated Python environment,
+  locked dependencies, authenticated missing-file downloads and offline preflight.
+  Bootstrap never launches training or establishes memory fit.
+- [Recovery training](docs/recovery-training.md): explicit opt-in CLI, transactional
+  checkpoint publication and fresh-process restoration. The standalone trainer
+  uses CLI arguments, not the AI Toolkit YAML files.
+- [Determinism diagnostics](docs/determinism-diagnostic.md): bounded traces of
+  inputs, RNG, losses, gradients and optimizer observations, plus optional strict
+  deterministic execution. Sampled equality is not complete tensor equality.
+- [Qualification and comparison](docs/qualification/deterministic-bf16-a100-2026-09-23.md):
+  preserved evidence, exact tested settings, manual reproduction commands and the
+  CPU-only checkpoint comparison utility.
 
-## Architecture
+Use `requirements-smoke.txt` for the documented isolated Python 3.12/CUDA 12.8
+standalone environment. Its filename is historical; do not combine it with the
+broader upstream `requirements.txt`. Models/data must be provisioned separately
+unless explicitly using bootstrap setup. Select Base 9B explicitly; ordinary
+training still defaults to 4B when `--model_path` is omitted.
 
+The recovery path uses one visible GPU, BF16, full transformer weights, uncached
+fixed-size images, batch/accumulation 1 and workers 0. It supports AdamW or
+Adafactor and optional EMA; the qualification used **Adafactor with EMA off**.
+The separate one-pair, one-step smoke path also offers AdamW8bit diagnostics;
+AdamW8bit is not supported by recovery. Multi-GPU, cached latents, sampling and
+trackers are rejected in recovery mode. No LoRA recovery path is implemented.
+
+## Fork Development Status
+
+Implemented work includes Base 9B preflight and component checks, full-transformer
+optimizer coverage, frozen-component checks, sequential VAE/text-encoder staging,
+one-step smoke tests, gradient/precision/memory diagnostics, optimizer-step evidence,
+deterministic data continuation, checkpoint integrity/publication/restoration,
+strict-determinism opt-in and read-only exact checkpoint comparison.
+
+**Scoped qualification:** At commit `875a32f`, the supplied single-A100-SXM4-80GB,
+deterministic BF16 Base 9B/Adafactor experiment compared four uninterrupted attempts
+against two attempts, checkpoint publication, process termination and explicit
+fresh-process recovery for attempts 3-4. All 42 final model shards and their
+index had matching SHA-256 records; exact semantic optimizer/scheduler/RNG/data
+state equality was reported. See the [qualification record](docs/qualification/deterministic-bf16-a100-2026-09-23.md)
+for independent checks, evidence limitations and full configuration.
+
+**Still unqualified:** Ordinary nondeterministic exact reproducibility, other
+hardware/software/configurations, GPU mid-epoch recovery, EMA recovery on GPU,
+longer training reliability and minimum hardware requirements. The historical
+nondeterministic trial/control mismatch is not explained by the new result.
+Checkpoint manifests retain `qualification='unqualified'`; they do not
+self-certify runs. CPU tests verify implementation behavior, not 9B GPU equivalence.
+
+### Development history
+
+- **Phase 1:** Smoke preparation, EMA disabling, Base 9B preflight, optimizer
+  coverage and a fixed-size uncached one-pair path.
+- **Phase 2A:** Sequential encoding, memory/precision/gradient diagnostics.
+- **Phase 2B:** Optimizer-specific step evidence.
+- **Recovery development:** Versioned integrity-checked checkpoints, transactional
+  publication, exact-state codecs, acknowledged data ordering and continuity tests.
+- **Initial qualification:** Publication/restoration succeeded; a nondeterministic
+  trial/control mismatch already existed before interruption.
+- **Determinism work:** Fresh-run traces, explicit strict backend settings and
+  the configuration-specific deterministic BF16 recovery result recorded above.
+
+Git commits preserve the detailed implementation history. The result does not
+qualify the AI Toolkit extension, multi-GPU workflow or general fine-tuning.
+
+## Upstream features and 4B reference examples
+
+The original project includes the `klein2` AI Toolkit extension, batch latent
+caching, legacy standalone DDP, resolution buckets, EMA and sample-generation
+code. These upstream paths are not covered by this fork's qualification.
+
+### Original 4B component description
+
+```text
+FLUX.2-klein-base-4B (upstream reference, not the 9B configuration)
+  Transformer: Flux2Transformer2DModel (4B)
+  Text encoder: Qwen3 4B (frozen)
+  VAE: AutoencoderKLFlux2 (BatchNorm + patchification)
+  Scheduler: FlowMatchEulerDiscreteScheduler
 ```
-FLUX.2-klein-base-4B
-├── Transformer: Flux2Transformer2DModel (4B params)
-├── Text Encoder: Qwen3 4B (frozen)
-├── VAE: AutoencoderKLFlux2 (BatchNorm + patchify)
-└── Scheduler: FlowMatchEulerDiscreteScheduler
-```
 
-## Quick Start
+The 9B path validates its own transformer and component metadata; do not infer
+9B text-encoder dimensions or memory requirements from the 4B description.
 
-### 1. Install
+### Original setup and commands (not 9B recovery instructions)
 
 ```bash
 pip install -r requirements.txt
-```
 
-### 2. Batch Latent Caching (Multi-GPU)
-
-```bash
-# Cache latents on 4 GPUs simultaneously
 python scripts/batch_cache_latents.py \
   --model_path black-forest-labs/FLUX.2-klein-base-4B \
-  --data_dir /path/to/images \
-  --num_gpus 4 \
-  --batch_size 8
-```
+  --data_dir /path/to/images --num_gpus 4 --batch_size 8
 
-### 3. Training (ai-toolkit)
-
-```bash
-# Single GPU
-python -m ai-toolkit run configs/train_fft_klein_base.yaml
-
-# Multi-GPU (coming soon)
-accelerate launch --num_processes=2 scripts/train_klein_ddp.py configs/train_fft_klein_base.yaml
-```
-
-### 4. Training (Standalone - Single GPU)
-
-```bash
 python scripts/train_klein_standalone.py \
   --model_path black-forest-labs/FLUX.2-klein-base-4B \
-  --data_dir /path/to/images \
-  --output_dir /path/to/output \
-  --batch_size 4 \
-  --steps 40000 \
-  --lr 3e-5
+  --data_dir /path/to/images --output_dir /path/to/output \
+  --batch_size 4 --steps 40000 --lr 3e-5
+
+accelerate launch --num_processes=4 --multi_gpu scripts/train_klein_standalone.py \
+  --model_path black-forest-labs/FLUX.2-klein-base-4B \
+  --data_dir /path/to/images --output_dir /path/to/output \
+  --batch_size 4 --grad_accum 2 --steps 40000 --lr 3e-5
 ```
 
-### 5. Training (Multi-GPU DDP)
-
-```bash
-# 4x GPU DDP training
-accelerate launch --num_processes=4 --multi_gpu \
-  scripts/train_klein_standalone.py \
-  --model_path black-forest-labs/FLUX.2-klein-base-4B \
-  --data_dir /path/to/images \
-  --output_dir /path/to/output \
-  --batch_size 4 \
-  --grad_accum 2 \
-  --steps 40000 \
-  --lr 3e-5
-
-# Resume from checkpoint
-accelerate launch --num_processes=4 --multi_gpu \
-  scripts/train_klein_standalone.py \
-  --model_path black-forest-labs/FLUX.2-klein-base-4B \
-  --data_dir /path/to/images \
-  --output_dir /path/to/output \
-  --resume_from /path/to/output/checkpoint-5000/accelerator_state
-```
-
-> With DDP, effective batch size = `batch_size x grad_accum x num_gpus`. For example, `--batch_size 4 --grad_accum 2` on 4 GPUs = effective batch 32.
+Legacy `--resume_from` is separate from the versioned recovery workflow and is
+not covered by its qualification; use the documented `--recovery_resume` path
+for recovery checkpoints. The previous `train_klein_ddp.py` example referenced
+an absent file and has been removed. AI Toolkit requires an external installation;
+its [extension](klein2/) and [example YAML](configs/train_fft_klein_base.yaml) are
+upstream configuration material, not a verified standalone launch recipe.
 
 ## Models Supported
 
-The table below is preserved from the original README. Its support checkmarks and recommendations are inherited claims, not results from this fork's validation. See [Fork Development Status](#fork-development-status) for the current evidence.
+This original table is retained for context. Its checkmarks, LoRA recommendations
+and license labels are inherited statements, not this fork's qualification results.
+The standalone recovery path accepts Base 9B and rejects known distilled variants.
+Consult each model's own terms; this table does not grant rights to model weights.
 
 | Model | Params | License | Recommended |
 |-------|--------|---------|-------------|
@@ -103,76 +139,20 @@ The table below is preserved from the original README. Its support checkmarks an
 | FLUX.2-klein-4B (distilled) | 4B | Apache 2.0 | ❌ Not for training |
 | FLUX.2-klein-9B (distilled) | 9B | Non-commercial | ❌ Not for training |
 
-> ⚠️ **Do NOT fine-tune the distilled models** (FLUX.2-klein-4B/9B). Training breaks the step distillation. Use the `base` variants instead.
 
-## Fork Development Status
+## Key Differences from Flux1 (upstream reference)
 
-This fork extends the original FLUX.2 Klein fine-tuning implementation with a dedicated verification and recovery path for **full-weight fine-tuning of FLUX.2 Klein Base 9B**.
+| Component | Flux1 (dev/schnell) | Flux2 Klein |
+|---|---|---|
+| Text encoder | CLIP + T5-XXL | Qwen3 |
+| VAE | AutoencoderKL (shift_factor) | AutoencoderKLFlux2 (BatchNorm + patchification) |
+| Transformer | FluxTransformer2DModel | Flux2Transformer2DModel |
+| Position IDs | 3D (H, W, C) | 4D (T, H, W, L) |
+| Pipeline | FluxPipeline | Flux2KleinPipeline |
 
-Development currently focuses on validating training execution, checkpoint publication, and numerical continuity across interrupted and resumed runs.
+## License information
 
-### Implemented
-
-- Base 9B architecture and component compatibility checks.
-- One-step smoke-test mode using an uncached image-caption pair.
-- Sequential VAE and text-encoder staging to reduce simultaneous GPU memory usage.
-- Verification of transformer parameter coverage and frozen components.
-- Gradient, optimizer-state, precision, and GPU-memory diagnostics.
-- Optimizer-specific step verification for AdamW, Adafactor, and AdamW8bit.
-- Recovery checkpoint publication and fresh-process restoration.
-- Recovery metadata, configuration serialization, and checkpoint-shard handling.
-
-### Validation status
-
-**Completed:**
-
-- 104 CPU recovery tests passed in the latest test run.
-- Real Klein Base 9B training executed on an NVIDIA A100 80GB GPU.
-- A four-step BF16 Adafactor experiment completed using two image-caption pairs.
-- An interrupted run published a checkpoint after step 2 and resumed in a fresh Python process to complete steps 3–4.
-- An uninterrupted control completed the same four-step configuration.
-- Both runs published their expected checkpoints without skipped steps.
-
-**Not yet qualified:**
-
-- Exact numerical equivalence between interrupted and uninterrupted training.
-- The trial and control model weights already differed at step 2, before the interruption.
-- The first source of divergence has not been identified.
-- Full training reliability beyond the short qualification experiment has not been established.
-- The minimum hardware requirements for this workflow have not been established.
-
-**Current conclusion:** Checkpoint publication and fresh-process restoration have been demonstrated. Exact numerical recovery remains unqualified.
-
-### Current investigation
-
-The next development task is to establish a reproducible baseline using two identical, uninterrupted training runs.
-
-The investigation will identify the first divergence in training inputs, random-number generation, model state, or optimizer updates before repeating the interrupted-versus-uninterrupted recovery comparison.
-
-Checkpoint restoration logic should not be changed solely on the basis of the existing mismatch.
-
-### Development history
-
-- **Phase 1 — Smoke-test preparation:** Added explicit EMA disabling, Base 9B preflight checks, full-transformer optimizer coverage, a fixed-size uncached one-pair path, and initial diagnostics and CPU tests.
-- **Phase 2A — Staged encoding and numerical diagnostics:** Added sequential component staging, memory accounting, optimizer reporting, seed and environment metadata, precision diagnostics, and gradient checks.
-- **Phase 2B — Optimizer-step evidence:** Added optimizer-specific state and step-counter verification.
-- **Recovery development:** Added checkpoint publication, restoration, continuity tests, and fixes for recovery metadata and serialization.
-- **Initial recovery qualification:** Demonstrated checkpoint publication and fresh-process restoration, but identified an unresolved numerical mismatch between trial and control runs.
-
-Git commits retain the detailed implementation history.
-
-This section describes the fork's standalone 9B verification and recovery work. It does not establish validation of the original AI Toolkit integration, multi-GPU training, or the complete training workflow.
-
-## Key Differences from Flux1
-
-| | Flux1 (dev/schnell) | Flux2 Klein |
-|--|---------------------|-------------|
-| Text Encoder | CLIP + T5-XXL | **Qwen3** |
-| VAE | AutoencoderKL (shift_factor) | **AutoencoderKLFlux2 (BatchNorm + patchify)** |
-| Transformer | FluxTransformer2DModel | **Flux2Transformer2DModel** |
-| Position IDs | 3D (H, W, C) | **4D (T, H, W, L)** |
-| Pipeline | FluxPipeline | **Flux2KleinPipeline** |
-
-## License
-
-Apache 2.0 (same as FLUX.2-klein-base-4B)
+The upstream README described the code as Apache 2.0. This checkout does not
+include a `LICENSE` file, so that statement should not be read as a newly supplied
+license grant. Model weights have separate terms; the 4B model's license does not
+establish the Base 9B model's license. This fork does not alter those terms.

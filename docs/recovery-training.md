@@ -1,4 +1,10 @@
-# Opt-in recovery training (unqualified)
+# Opt-in recovery training (configuration-specific qualification)
+
+The [deterministic BF16 qualification record](qualification/deterministic-bf16-a100-2026-09-23.md)
+preserves the supplied A100/Base 9B/Adafactor four-attempt recovery result and
+its limits. Ordinary nondeterministic exact reproducibility remains unqualified.
+Checkpoint manifests and existing trainer messages retain the conservative
+`unqualified` label; a checkpoint does not self-certify a new experiment.
 
 `--recovery` uses manifest v2 and the existing version-1 payload codecs. Legacy
 training and `--smoke_test` retain their separate behavior. V1 checkpoints remain
@@ -8,23 +14,26 @@ discovery, retention, sampling recovery or tracker recovery.
 
 The candidate configuration is one visible CUDA GPU, BF16, full weights, batch
 and accumulation 1, workers 0, uncached fixed-size images, AdamW or Adafactor,
-and optional EMA. This path is **not qualified for exact recovery**. CPU fixture
+and optional EMA. Only the configuration in the linked record is qualified by
+the supplied GPU experiment; EMA and other candidate settings are not. CPU fixture
 tests cannot establish CUDA, actual Flux, or prepared-Accelerate behavior on the
 target machine. Keep the original model, dataset, software, code and settings
 immutable between processes. Content fingerprints are relocation-independent;
 dependency/backend/configuration changes fail strict compatibility checks.
 
-## Controlled four-attempt trial
+## Controlled four-attempt trial (strict deterministic profile)
 
 Run on an already provisioned environment; these commands install/download
-nothing. Replace all paths. Start with at least two image-caption pairs and
+nothing. Replace all paths. Use the two recorded image-caption pairs (or treat
+different data as a new experiment) and
 an empty writable output directory. Keep `--steps 4` unchanged on resume.
 `--recovery_stop_after` is an absolute stop boundary, not a new LR horizon.
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
 python scripts/train_klein_standalone.py \
-  --recovery --recovery_model_variant base-9b \
+  --recovery --deterministic_recovery --recovery_model_variant base-9b \
   --model_path /LOCAL/FLUX.2-klein-base-9B \
   --data_dir /LOCAL/image-caption-pairs --output_dir /LOCAL/recovery-trial \
   --target_size 256 --optimizer adafactor --no_ema \
@@ -33,7 +42,7 @@ python scripts/train_klein_standalone.py \
   --seed 42 --sample_prompts --recovery_stop_after 2
 
 python scripts/train_klein_standalone.py \
-  --recovery --recovery_model_variant base-9b \
+  --recovery --deterministic_recovery --recovery_model_variant base-9b \
   --model_path /LOCAL/FLUX.2-klein-base-9B \
   --data_dir /LOCAL/image-caption-pairs --output_dir /LOCAL/recovery-trial \
   --target_size 256 --optimizer adafactor --no_ema \
@@ -51,6 +60,17 @@ separate EMA-enabled trial. Checkpoint IDs/timestamps naturally differ. The
 four-attempt trial has no warmup (the trainer caps warmup at steps // 10); CPU
 continuity tests separately cover manual warmup and simulated skips. Verify
 actual Accelerate skips separately before broader qualification.
+
+Compare the complete final checkpoints without loading a model or using CUDA:
+
+```bash
+python -B scripts/compare_recovery_checkpoints.py \
+  /LOCAL/recovery-control/checkpoint-4 /LOCAL/recovery-trial/checkpoint-4
+```
+
+Exit 0 establishes exact comparison under the utility's documented provenance
+policy, not proof that the processes followed the protocol. Preserve launch logs.
+See the qualification record for the comparison contract and evidence gaps.
 
 ## Boundaries and limitations
 

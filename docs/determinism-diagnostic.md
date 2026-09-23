@@ -4,6 +4,13 @@ This opt-in sidecar helps locate the **first observed difference** between two
 fresh uninterrupted recovery runs. It does not fix nondeterminism, qualify exact
 recovery, or change deterministic-algorithm/backend settings.
 
+The subsequent [scoped deterministic BF16 recovery result](qualification/deterministic-bf16-a100-2026-09-23.md)
+is preserved separately. That experiment does not qualify ordinary nondeterministic
+exact reproducibility. Use `compare_recovery_checkpoints.py` for complete final
+checkpoint comparison; this sampled trace comparator intentionally reports
+configuration differences such as a trial's `stop_after` value and is not a
+replacement for the checkpoint comparator.
+
 Append to the existing recovery command (same training settings in both runs):
 
 ```text
