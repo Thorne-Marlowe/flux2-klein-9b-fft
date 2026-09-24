@@ -1,0 +1,42 @@
+# Standalone Base 9B smoke test: CPython 3.12, Windows/Linux x86-64, CUDA 12.8.
+# Separate from requirements.txt (AI Toolkit / ordinary training).
+# Compile with uv 0.10.9; requirements-smoke.txt pins transitive dependencies too.
+# Metadata resolution and source API inspection are NOT CUDA execution validation.
+# Use requirements-smoke.txt in a fresh CPython 3.12 environment, not this input
+# file and not together with the broad ordinary-training requirements.txt.
+# The +cu128 pins select CUDA wheels explicitly; a compatible NVIDIA driver is
+# still required. CPU test execution uses the existing environment, not this lock.
+# bitsandbytes is included for the optional AdamW8bit choice. PEFT, TensorBoard,
+# and wandb are not needed for the default standalone smoke command; do not enable
+# optional logging flags with this specification.
+#
+# Verified without installation (uv 0.10.9): 64-package universal resolution, then
+# binary-only resolution of the resulting lock for CPython 3.12 on both
+# x86_64-pc-windows-msvc and x86_64-unknown-linux-gnu. No package builds or Python
+# downloads were allowed. The local Python is 3.14, so this is metadata/wheel
+# verification, not execution of the pinned Python 3.12 environment.
+# Exact versions include transitive dependencies, but this is not an artifact
+# hash lock. Other platforms/Python versions have not been verified.
+#
+# API references inspected:
+# https://github.com/huggingface/diffusers/blob/v0.37.0/src/diffusers/pipelines/flux2/pipeline_flux2_klein.py
+#   Flux2KleinPipeline, Qwen3 prompt helper, latent/text ID helpers.
+# https://github.com/huggingface/accelerate/blob/v1.12.0/src/accelerate/accelerator.py
+#   prepare/backward/clip/unwrap, step-skipped property, cleanup methods.
+# https://github.com/bitsandbytes-foundation/bitsandbytes/blob/0.49.2/bitsandbytes/optim/optimizer.py
+#   AdamW8bit state1/state2 and step counter (CUDA behavior still unverified).
+# https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/qwen3/modeling_qwen3.py
+#   Qwen3 is present at the corrected broad minimum; smoke pins 5.3.0 below.
+# https://pytorch.org/get-started/previous-versions/
+#   Official Torch 2.10.0 / Torchvision 0.25.0 CUDA 12.8 pairing.
+--index-url https://pypi.org/simple
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+diffusers==0.37.0
+transformers==5.3.0
+accelerate==1.12.0
+bitsandbytes==0.49.2
+safetensors==0.7.0
+pillow==12.1.1
+tqdm==4.67.3

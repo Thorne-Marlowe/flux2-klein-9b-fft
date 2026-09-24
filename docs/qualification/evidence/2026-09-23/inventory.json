@@ -1,0 +1,298 @@
+{
+  "archive": "recovery-qualification-evidence.tar.gz",
+  "configuration": {
+    "batch_size": 1,
+    "dataset_size": 2,
+    "device": "cuda",
+    "distributed_type": "NO",
+    "drop_last": true,
+    "ema_decay": null,
+    "ema_enabled": false,
+    "gradient_accumulation_steps": 1,
+    "gradient_checkpointing": true,
+    "max_grad_norm": 1.0,
+    "num_workers": 0,
+    "optimizer": "adafactor",
+    "optimizer_options": [
+      {
+        "beta1": null,
+        "clip_threshold": 1.0,
+        "decay_rate": -0.8,
+        "eps": [
+          1e-30,
+          0.001
+        ],
+        "initial_lr": 3e-05,
+        "lr": 3e-05,
+        "relative_step": false,
+        "scale_parameter": false,
+        "warmup_init": false,
+        "weight_decay": 0.0
+      }
+    ],
+    "precision": "bf16",
+    "sampling_enabled": false,
+    "scaler_enabled": false,
+    "schedule_policy": "standalone_warmup_cosine_v1",
+    "seed": 42,
+    "seed_policy": "klein_recovery_v1_domain_separated",
+    "total_optimizer_steps": 4,
+    "tracking_enabled": false,
+    "use_cached_latents": false,
+    "warmup_steps": 0,
+    "world_size": 1
+  },
+  "environment": {
+    "backend_settings": {
+      "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+      "attention_processors": {
+        "single_transformer_blocks.0.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.1.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.10.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.11.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.12.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.13.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.14.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.15.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.16.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.17.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.18.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.19.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.2.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.20.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.21.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.22.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.23.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.3.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.4.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.5.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.6.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.7.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.8.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "single_transformer_blocks.9.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2ParallelSelfAttnProcessor"
+        },
+        "transformer_blocks.0.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        },
+        "transformer_blocks.1.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        },
+        "transformer_blocks.2.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        },
+        "transformer_blocks.3.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        },
+        "transformer_blocks.4.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        },
+        "transformer_blocks.5.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        },
+        "transformer_blocks.6.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        },
+        "transformer_blocks.7.attn.processor": {
+          "backend": null,
+          "class": "diffusers.models.transformers.transformer_flux2.Flux2AttnProcessor"
+        }
+      },
+      "bf16_reduced_precision_reduction": true,
+      "cuda_matmul_allow_tf32": false,
+      "cudnn_allow_tf32": true,
+      "cudnn_benchmark": false,
+      "cudnn_deterministic": false,
+      "deterministic_algorithms": true,
+      "deterministic_warn_only": false,
+      "float32_matmul_precision": "highest",
+      "fp16_reduced_precision_reduction": true,
+      "math_sdpa_reduced_precision": false,
+      "sdpa": {
+        "cudnn": true,
+        "flash": true,
+        "math": true,
+        "mem_efficient": true
+      }
+    },
+    "cuda_runtime": "12.8",
+    "dependencies": {
+      "accelerate": "1.12.0",
+      "diffusers": "0.37.0",
+      "numpy": "2.5.3",
+      "pillow": "12.1.1",
+      "safetensors": "0.7.0",
+      "torch": "2.10.0+cu128",
+      "torchvision": "0.25.0+cu128",
+      "transformers": "5.3.0"
+    },
+    "machine": "x86_64",
+    "platform": "linux",
+    "python": "3.12.3"
+  },
+  "evidence_status": "Supplied historical experiment; binary checkpoint payloads and semantic comparison script are not included.",
+  "fingerprints": {
+    "dataset": "21776d83527d26a48b6a22c97591b1b3ddfb53e22afcb468d945b8c31debb95e",
+    "model": "9d41c77c207734271e2b0578f01bc8c9d8efdac2e8367ef9272affd55a6552e6",
+    "preprocessing": "7a8ae13d49e479a66b49cc5435f6c1e88aaecc991782aa6f9ff3207511c0b281",
+    "source_code": "0e67ff8545d5af7fc08d2ab680857ca6639ec3482e170c1794e5f1e42500a7b1"
+  },
+  "members": [
+    {
+      "path": "recovery-qualification-evidence/QUALIFICATION-RESULT.txt",
+      "sha256": "9be8dcbc98bc49b75a1f2d6194c9f2395e5d885157c858e8f67e9930a26175c7",
+      "size_bytes": 1733
+    },
+    {
+      "path": "recovery-qualification-evidence/resumed-json/model-config.json",
+      "sha256": "d14c8d7a9f1c632c0877f1b91b443eb1f34631e951ffd50a424957af1206452b",
+      "size_bytes": 495
+    },
+    {
+      "path": "recovery-qualification-evidence/resumed-json/trainer.json",
+      "sha256": "6612d197b85da8935dccfe3d519036864a4e6ee926f622e9ad0d96ebf0cbd407",
+      "size_bytes": 432
+    },
+    {
+      "path": "recovery-qualification-evidence/resumed-json/manifest.json",
+      "sha256": "8e925a7d6947be3e7888e5f4dee5cfda8049ac63991048814353a1c77047cffe",
+      "size_bytes": 78369
+    },
+    {
+      "path": "recovery-qualification-evidence/control-json/model-config.json",
+      "sha256": "1c5566af22870ba562c621bbb7c049ba277999352c51af2ff7168397d1285f29",
+      "size_bytes": 495
+    },
+    {
+      "path": "recovery-qualification-evidence/control-json/trainer.json",
+      "sha256": "b6bc9d4876819449ae87b988750b15045582f45f3f2b5d6d038bc9a7b06ccec7",
+      "size_bytes": 432
+    },
+    {
+      "path": "recovery-qualification-evidence/control-json/manifest.json",
+      "sha256": "c99e508532b96c790c8b9da925fcd6a370cae36f2c740e88fc18c603c1adfac3",
+      "size_bytes": 78369
+    },
+    {
+      "path": "recovery-qualification-evidence/raw-checkpoint-hash-diff.txt",
+      "sha256": "4fabe66be2ee4134c3063d94c2c47db2c4220c7f221d2485b7d2332fd176a396",
+      "size_bytes": 2056
+    },
+    {
+      "path": "recovery-qualification-evidence/resumed-checkpoint-4.sha256",
+      "sha256": "4fcf3f23bd26793a9374a6517ba4e7a5accab9dfc21dad3fdcdf1291ed768a91",
+      "size_bytes": 5939
+    },
+    {
+      "path": "recovery-qualification-evidence/control-checkpoint-4.sha256",
+      "sha256": "4059e602cb64a31491e401fda2f5d1d294537f0ec176e5c26a9468341cff7fc3",
+      "size_bytes": 5939
+    },
+    {
+      "path": "recovery-qualification-evidence/control-trace.jsonl",
+      "sha256": "c96926bb42edf43ca9630514d7a4119e04b191f707c7517fab618e97a1400406",
+      "size_bytes": 5865853
+    },
+    {
+      "path": "recovery-qualification-evidence/resumed-phase1-trace.jsonl",
+      "sha256": "926b70b126065c517ab2a918e733e96fb0955118d17c2eef05f4db1c98ccfc31",
+      "size_bytes": 3190091
+    },
+    {
+      "path": "recovery-qualification-evidence/environment.txt",
+      "sha256": "9ad82518629f2f3efa634405cfc83666a932f958381992b81e2f9b51d829d971",
+      "size_bytes": 243
+    },
+    {
+      "path": "recovery-qualification-evidence/git-status.txt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size_bytes": 0
+    },
+    {
+      "path": "recovery-qualification-evidence/git-commit.txt",
+      "sha256": "e806835e2712fb60e7d0eaf297ae1d66be65a4c69e804dfd62bda51f0c17b7e0",
+      "size_bytes": 41
+    }
+  ],
+  "qualification_scope": "Explicit recovery from completed-attempt-2 under the recorded two-pair/four-attempt deterministic BF16 configuration.",
+  "sha256": "c889f28adf4a917ff5240eebc4af38cfe3cdbe66236538a13b810f1aa35da35d",
+  "size_bytes": 1949665,
+  "tested_commit": "875a32f61726d332d886a9729a86b3ee2d363919"
+}
