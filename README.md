@@ -3,14 +3,14 @@
 This fork develops standalone **full-weight FLUX.2 Klein Base 9B training,
 diagnostics and checkpoint recovery** alongside the original 4B-oriented code.
 A recorded deterministic BF16 experiment reproduced the uninterrupted control's
-final model and recoverable state after explicit recovery from checkpoint-2.
-This is qualification of the recorded short configuration, not general exact
-reproducibility or production-training reliability.
+final model and recoverable state after explicit mid-epoch recovery from
+checkpoint-1. This is qualification of the recorded configuration, not general
+exact reproducibility or production-training reliability.
 
 > **Fork notice:** Original 4B examples and AI Toolkit integration are retained
 > as upstream material. They are not validated instructions for the fork's 9B
 > recovery path. See [Fork Development Status](#fork-development-status) and the
-> [qualification record](docs/qualification/deterministic-bf16-a100-2026-09-23.md).
+> [qualification record](docs/qualification/milestone-3-mid-epoch.md).
 
 ## Standalone Base 9B workflow
 
@@ -26,6 +26,8 @@ reproducibility or production-training reliability.
 - [Qualification and comparison](docs/qualification/deterministic-bf16-a100-2026-09-23.md):
   preserved evidence, exact tested settings, manual reproduction commands and the
   CPU-only checkpoint comparison utility.
+- [Milestone 3 qualification](docs/qualification/milestone-3-mid-epoch.md):
+  completed three-pair, seven-attempt mid-epoch and cross-epoch recovery result.
 
 Use `requirements-smoke.txt` for the documented isolated Python 3.12/CUDA 12.8
 standalone environment. Its filename is historical; do not combine it with the
@@ -46,20 +48,24 @@ Implemented work includes Base 9B preflight and component checks, full-transform
 optimizer coverage, frozen-component checks, sequential VAE/text-encoder staging,
 one-step smoke tests, gradient/precision/memory diagnostics, optimizer-step evidence,
 deterministic data continuation, checkpoint integrity/publication/restoration,
-strict-determinism opt-in and read-only exact checkpoint comparison.
+strict-determinism opt-in, read-only exact checkpoint comparison and independent
+CPU verification of saved Diffusers transformer artifacts.
 
-**Scoped qualification:** At commit `875a32f`, the supplied single-A100-SXM4-80GB,
-deterministic BF16 Base 9B/Adafactor experiment compared four uninterrupted attempts
-against two attempts, checkpoint publication, process termination and explicit
-fresh-process recovery for attempts 3-4. All 42 final model shards and their
-index had matching SHA-256 records; exact semantic optimizer/scheduler/RNG/data
-state equality was reported. See the [qualification record](docs/qualification/deterministic-bf16-a100-2026-09-23.md)
-for independent checks, evidence limitations and full configuration.
+**Milestone 3 qualification passed:** Using commit `9958912fd9890f33b716245efea4d9e8f5902693`,
+a single A100-SXM4-80GB ran deterministic BF16 Base 9B Adafactor training on
+three image-caption pairs for seven attempts. A fresh process resumed explicitly
+from `trial/checkpoint-1` at epoch 0/index 1 and produced exact final model and
+recoverable-state equality with the uninterrupted control at attempt 7, under
+the comparator's documented provenance exclusions. See the [Milestone 3 record](docs/qualification/milestone-3-mid-epoch.md)
+and the [original four-attempt record](docs/qualification/deterministic-bf16-a100-2026-09-23.md).
 
 **Still unqualified:** Ordinary nondeterministic exact reproducibility, other
-hardware/software/configurations, GPU mid-epoch recovery, EMA recovery on GPU,
-longer training reliability and minimum hardware requirements. The historical
-nondeterministic trial/control mismatch is not explained by the new result.
+hardware/software/configurations, Base 9B GPU inference, EMA recovery on GPU,
+longer production training and minimum hardware requirements. The historical
+nondeterministic trial/control mismatch is not explained by the deterministic
+results. Milestone 2B GPU inference is deferred, not failed, because the
+available checkpoint transfer path returned HTTP 502; no verifier defect was
+observed.
 Checkpoint manifests retain `qualification='unqualified'`; they do not
 self-certify runs. CPU tests verify implementation behavior, not 9B GPU equivalence.
 
@@ -75,6 +81,9 @@ self-certify runs. CPU tests verify implementation behavior, not 9B GPU equivale
   trial/control mismatch already existed before interruption.
 - **Determinism work:** Fresh-run traces, explicit strict backend settings and
   the configuration-specific deterministic BF16 recovery result recorded above.
+- **Milestone 3:** Real single-A100 deterministic BF16 mid-epoch and cross-epoch
+  recovery passed for the documented three-pair/seven-attempt configuration.
+- **Milestone 2B:** GPU inference remains deferred; CPU artifact loading is complete.
 
 Git commits preserve the detailed implementation history. The result does not
 qualify the AI Toolkit extension, multi-GPU workflow or general fine-tuning.

@@ -1,8 +1,10 @@
 # Opt-in recovery training (configuration-specific qualification)
 
-The [deterministic BF16 qualification record](qualification/deterministic-bf16-a100-2026-09-23.md)
-preserves the supplied A100/Base 9B/Adafactor four-attempt recovery result and
-its limits. Ordinary nondeterministic exact reproducibility remains unqualified.
+The [Milestone 3 qualification record](qualification/milestone-3-mid-epoch.md)
+records the completed single-A100/Base 9B/Adafactor seven-attempt mid-epoch and
+cross-epoch recovery result. The earlier [four-attempt record](qualification/deterministic-bf16-a100-2026-09-23.md)
+is preserved as historical evidence. Ordinary nondeterministic exact
+reproducibility remains unqualified.
 Checkpoint manifests and existing trainer messages retain the conservative
 `unqualified` label; a checkpoint does not self-certify a new experiment.
 
