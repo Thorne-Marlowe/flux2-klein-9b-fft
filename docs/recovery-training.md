@@ -72,6 +72,42 @@ Exit 0 establishes exact comparison under the utility's documented provenance
 policy, not proof that the processes followed the protocol. Preserve launch logs.
 See the qualification record for the comparison contract and evidence gaps.
 
+## Verify a published transformer artifact
+
+The recovery checkpoint's `model/` directory is independently consumable by
+Diffusers. Run this CPU-only structural check against an already published
+checkpoint; it loads the public `Flux2Transformer2DModel.from_pretrained` path,
+checks every serialized tensor's names, shapes, dtypes and values, and never
+rewrites the artifact:
+
+```bash
+python -B scripts/verify_inference_artifact.py \
+  --artifact /LOCAL/recovery-trial/checkpoint-4/model
+```
+
+This proves loader compatibility and serialization integrity for the artifact;
+it does not prove Base 9B inference or training quality. The check may require
+RAM comparable to the transformer because the public loader constructs a model;
+tensor comparison itself reads safetensor shards one at a time.
+
+For a later inference-only GPU qualification, use the original frozen Base 9B
+directory separately from the trained transformer. Do not run this command
+until both directories already exist:
+
+```bash
+python -B scripts/verify_inference_artifact.py \
+  --artifact /LOCAL/recovery-trial/checkpoint-4/model \
+  --model-path /LOCAL/FLUX.2-klein-base-9B \
+  --prompt "a small red house in sunlight" \
+  --steps 2 --height 256 --width 256 \
+  --output /LOCAL/recovery-trial/artifact-inference.png
+```
+
+Successful GPU execution establishes that this trained transformer can be
+inserted into the normal Klein pipeline and produce a structurally valid image
+on that environment. It does not establish image quality, minimum hardware,
+long-run reliability or a broader training qualification.
+
 ## Boundaries and limitations
 
 - Recovery Adafactor retains its existing **effective weight decay of zero**.
