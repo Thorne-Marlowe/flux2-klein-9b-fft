@@ -1,0 +1,4 @@
+﻿# Linux/container files must retain LF line endings.
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+docker/*.sh text eol=lf
