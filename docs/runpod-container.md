@@ -254,6 +254,63 @@ time later, but it is not required. Hydration does not export checkpoints or
 results, create Pods, start training, or establish a new GPU or
 deterministic-recovery qualification.
 
+## Durable recovery-artifact transport (Phase 4.3)
+
+After the existing trainer has published a complete local recovery checkpoint,
+an operator may explicitly preserve it in a private Hugging Face model
+repository. This is a foreground command; it neither watches the trainer nor
+starts, resumes, or modifies training:
+
+```bash
+HF_OUTPUT_TOKEN='provided-by-runtime-secret' \
+python scripts/export_runpod_artifacts.py export \
+  --checkpoint-dir /workspace/runs/experiment/checkpoint-2 \
+  --repository owner/private-klein-checkpoints \
+  --revision main
+```
+
+The command first calls the existing `validate_checkpoint()` recovery validator,
+then builds an exact byte inventory. It stores regular checkpoint files under a
+content-derived namespace such as `exports/attempt-2-<identity>/checkpoint/`.
+The final `export-record.json` is the completion signal and is uploaded last.
+An interrupted upload may leave files in a private namespace, but without that
+record it is not an export Phase 4.3 will import. Local checkpoints are never
+deleted after export.
+
+On a fresh Pod, hydrate the model and dataset first, then explicitly import one
+known completed export:
+
+```bash
+HF_OUTPUT_TOKEN='provided-by-runtime-secret' \
+python scripts/export_runpod_artifacts.py import \
+  --repository owner/private-klein-checkpoints \
+  --export-id attempt-2-<identity> \
+  --destination /workspace/runs/recovered/checkpoint-2 \
+  --revision main
+```
+
+Import resolves the selected repository revision to an immutable Hub commit,
+downloads the completion record first, and downloads only its declared files to
+private local staging. It verifies every size and SHA-256, calls the same
+existing checkpoint validator, and atomically publishes the requested local
+destination without overwriting an existing different checkpoint. The operator
+then runs the existing preflight and explicitly chooses the existing
+recovery-resume command.
+
+`HF_OUTPUT_TOKEN` is environment-only and is never accepted on the command
+line, printed, or written into local or remote completion records. It does not
+fall back to `HF_TOKEN`. The remote completion record preserves source and
+revision provenance, checkpoint transport identity, and the exact file
+inventory; the command result reports the completion upload's immutable Hub
+commit when the Hub API provides it.
+
+The intended sequence is hydrate assets, preflight, manually run the trainer,
+export a complete local checkpoint, verify the durable completion record, then
+terminate the Pod. Terminating a Pod before a successful export can lose newer
+local progress. Phase 4.3 is not continuous replication, retention, pruning,
+or automatic latest-checkpoint recovery, and it is not a new GPU or
+deterministic-recovery qualification.
+
 ## Deterministic recovery relationship
 
 The image packages the code and dependency lock used by the qualified
