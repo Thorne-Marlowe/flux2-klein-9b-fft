@@ -45,6 +45,7 @@ runs/**
 *.bin
 *.tar
 *.tar.gz
+**/*.tar.gz
 *.tgz
 *.zip
 *.7z

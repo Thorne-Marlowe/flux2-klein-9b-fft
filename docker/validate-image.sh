@@ -106,11 +106,17 @@ test -d "$repository/docs"
 test -f "$repository/requirements-smoke.txt"
 test ! -e "$repository/.git"
 for path in models model datasets data outputs checkpoints runs; do test ! -e "$repository/$path"; done
-if find "$repository" -xdev -type f \( -name "*.safetensors" -o -name "*.safetensors.index.json" -o -name "*.ckpt" -o -name "*.pth" -o -name "*.pt" -o -name "*.bin" -o -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" -o -name "*.7z" \) -print -quit | grep -q .; then
-  echo "runtime asset or archive found in image" >&2; exit 1
+runtime_assets="$(find "$repository" -xdev -type f \( -name "*.safetensors" -o -name "*.safetensors.index.json" -o -name "*.ckpt" -o -name "*.pth" -o -name "*.pt" -o -name "*.bin" -o -name "*.tar" -o -name "*.tar.gz" -o -name "*.tgz" -o -name "*.zip" -o -name "*.7z" \) -print)"
+if [ -n "$runtime_assets" ]; then
+  echo "runtime asset or archive found in image:" >&2
+  printf '%s\n' "$runtime_assets" >&2
+  exit 1
 fi
-if find "$repository" -xdev -type f \( -name ".env" -o -name ".env.*" -o -name "*.pem" -o -name "*.key" \) -print -quit | grep -q .; then
-  echo "credential-like file found in image" >&2; exit 1
+credential_files="$(find "$repository" -xdev -type f \( -name ".env" -o -name ".env.*" -o -name "*.pem" -o -name "*.key" \) -print)"
+if [ -n "$credential_files" ]; then
+  echo "credential-like file found in image:" >&2
+  printf '%s\n' "$credential_files" >&2
+  exit 1
 fi
 '
 
