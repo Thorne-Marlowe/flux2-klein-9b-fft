@@ -78,6 +78,16 @@ jobs:
           cache-from: type=gha,scope=runpod-linux-amd64
           cache-to: type=gha,mode=max,scope=runpod-linux-amd64
 
+      - name: Verify preserved qualification evidence in checked-out source
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python \
+            --mount "type=bind,source=${GITHUB_WORKSPACE},target=/source,readonly" \
+            --env PYTHONPATH=/source:/source/tests \
+            --workdir /source/tests "${CANDIDATE_IMAGE}" \
+            -m unittest -v test_checkpoint_comparison.PreservedEvidenceTests
+
       - name: Validate exact locally loaded candidate
         shell: bash
         run: |
@@ -179,6 +189,16 @@ jobs:
             REQUIREMENTS_LOCK_SHA256=${{ steps.identity.outputs.lock_sha256 }}
           cache-from: type=gha,scope=runpod-linux-amd64
           cache-to: type=gha,mode=max,scope=runpod-linux-amd64
+
+      - name: Verify preserved qualification evidence in checked-out source
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint python \
+            --mount "type=bind,source=${GITHUB_WORKSPACE},target=/source,readonly" \
+            --env PYTHONPATH=/source:/source/tests \
+            --workdir /source/tests "${CANDIDATE_IMAGE}" \
+            -m unittest -v test_checkpoint_comparison.PreservedEvidenceTests
 
       - name: Record validated local image ID
         id: local_image

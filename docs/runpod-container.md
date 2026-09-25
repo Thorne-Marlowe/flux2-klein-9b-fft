@@ -287,8 +287,11 @@ the Dockerfile. It validates matching OCI labels and
 The local candidate validation checks Linux amd64 platform, entrypoint command
 passthrough and zero-argument idle behavior, `pip check`, core locked imports,
 the CUDA 12.8 PyTorch build, system-profile preflight JSON, both relevant CLI
-help paths, the practical CPU test suite, and the real Linux checkpoint
-no-replace rename test. Expected CPU-runner preflight warnings for missing GPU
+help paths, the runtime-compatible CPU test suite, and the real Linux checkpoint
+no-replace rename test. The preserved-qualification-evidence hash test runs
+separately against the read-only checked-out source repository, where its
+intentional archive dependency is available; it is not skipped or treated as
+an image-runtime test. Expected CPU-runner preflight warnings for missing GPU
 or `/workspace` are allowed; any preflight `FAIL` is rejected. It also checks
 that source, tests, docs, and requirements are present while `.git`, top-level
 runtime asset directories, model/checkpoint/archive formats, and common secret

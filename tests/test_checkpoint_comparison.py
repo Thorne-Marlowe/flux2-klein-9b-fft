@@ -185,6 +185,10 @@ class CheckpointComparisonTests(unittest.TestCase):
 
 
 class PreservedEvidenceTests(unittest.TestCase):
+    # The production image deliberately excludes the preserved archive. This
+    # remains a required source-repository integrity test in CI.
+    requires_source_repository = True
+
     def test_original_archive_hashes_metadata_and_boundary_are_preserved(self):
         root = Path(__file__).resolve().parents[1] / "docs/qualification/evidence/2026-09-23"
         inventory = json.loads((root / "inventory.json").read_text())

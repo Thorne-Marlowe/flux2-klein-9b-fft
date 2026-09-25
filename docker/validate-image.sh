@@ -93,7 +93,7 @@ if failures:
 
 docker run --rm "${IMAGE}" python scripts/train_klein_standalone.py --help >/dev/null
 docker run --rm "${IMAGE}" python scripts/runpod_preflight.py --help >/dev/null
-docker run --rm "${IMAGE}" python -m unittest discover -s tests -p 'test_*.py'
+docker run --rm "${IMAGE}" python scripts/run_container_tests.py
 rename_test_output="$(docker run --rm "${IMAGE}" python -m unittest -v tests.test_runpod_preflight.RunpodPreflightTests.test_real_linux_checkpoint_rename_probe_publishes_and_cleans_up 2>&1)" || fail "Linux checkpoint-rename test failed"
 printf '%s\n' "${rename_test_output}"
 if grep -Eiq 'skipped|OK \(skipped=' <<<"${rename_test_output}"; then fail "Linux checkpoint-rename test was skipped"; fi
