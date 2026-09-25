@@ -1,10 +1,19 @@
 import tempfile
 import unittest
 from pathlib import Path
+import shlex
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.prepare_recovery_qualification import build_plan, dataset_inventory
+
+
+def option_value(command, option):
+    tokens = shlex.split(command)
+    index = tokens.index(option)
+    if index + 1 == len(tokens):
+        raise AssertionError(f"{option} has no value in {command!r}")
+    return tokens[index + 1]
 
 
 class RecoveryQualificationPlanTests(unittest.TestCase):
@@ -21,13 +30,17 @@ class RecoveryQualificationPlanTests(unittest.TestCase):
             self.assertEqual(plan["boundary"]["checkpoint_next_batch_index"], 1)
             self.assertEqual(plan["boundary"]["final_epoch"], 2)
             self.assertEqual(plan["boundary"]["final_next_batch_index"], 1)
-            self.assertIn("--output_dir '" + str(root / "runs" / "control") + "'", plan["commands"]["control"])
-            self.assertIn("--output_dir '" + str(root / "runs" / "trial") + "'", plan["commands"]["interrupted"])
-            self.assertIn("--recovery_stop_after 1", plan["commands"]["interrupted"])
-            self.assertIn("--output_dir '" + str(root / "runs" / "resumed") + "'", plan["commands"]["resume"])
-            self.assertIn("--recovery_resume '" + str(root / "runs" / "trial" / "checkpoint-1") + "'", plan["commands"]["resume"])
-            self.assertIn("'" + str(root / "runs" / "control" / "checkpoint-7") + "' '" +
-                          str(root / "runs" / "resumed" / "checkpoint-7") + "'", plan["commands"]["compare"])
+            control = root / "runs" / "control"
+            trial = root / "runs" / "trial"
+            resumed = root / "runs" / "resumed"
+            self.assertEqual(option_value(plan["commands"]["control"], "--output_dir"), str(control))
+            self.assertEqual(option_value(plan["commands"]["interrupted"], "--output_dir"), str(trial))
+            self.assertEqual(option_value(plan["commands"]["interrupted"], "--recovery_stop_after"), "1")
+            self.assertEqual(option_value(plan["commands"]["resume"], "--output_dir"), str(resumed))
+            self.assertEqual(option_value(plan["commands"]["resume"], "--recovery_resume"),
+                             str(trial / "checkpoint-1"))
+            self.assertEqual(shlex.split(plan["commands"]["compare"])[-2:],
+                             [str(control / "checkpoint-7"), str(resumed / "checkpoint-7")])
 
     def test_rejects_wrong_dataset_size_and_missing_model(self):
         with tempfile.TemporaryDirectory() as directory:
