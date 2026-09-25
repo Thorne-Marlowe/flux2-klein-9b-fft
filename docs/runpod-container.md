@@ -199,6 +199,61 @@ and paths. It is not a new Base 9B training, numerical-equivalence, or
 deterministic-recovery qualification, and it does not replace the existing
 deterministic A100 recovery qualification.
 
+## Disposable asset hydration (Phase 4.2)
+
+`scripts/hydrate_runpod_assets.py` prepares a disposable `/workspace` without
+starting training. Copy `configs/runpod-assets.example.json` outside the
+repository, replace its placeholder immutable revisions and dataset repository,
+then provide `HF_TOKEN` through a Runpod Secret or runtime environment:
+
+```bash
+HF_TOKEN='provided-by-runtime-secret' \
+python scripts/hydrate_runpod_assets.py --config /workspace/assets.json
+```
+
+The token is environment-only. The hydrator never performs an interactive
+Hugging Face login, prints a token, writes it to a completion record, or accepts
+it on the command line. The model request is resolved to a 40-character Hub
+commit and uses the existing Base 9B selection, download, gated-access, and
+offline validation logic. It downloads only the Diffusers files selected by the
+offline resolver and does not allocate model weights on a GPU.
+
+The dataset source is a Hugging Face dataset repository at an explicitly
+resolved revision. The hydrator first downloads `dataset-manifest.json`, then
+only the plain tar shards declared by that Phase 4.1 manifest. It validates the
+unchanged package and reconstructs the normal top-level image-plus-caption
+directory consumed by `--data_dir`. See [dataset transport](dataset-transport.md)
+for the tar package contract.
+
+The explicit hydration command creates only missing empty standard workspace
+parents (`models`, `datasets`, `runs`, `evidence`, and `cache`); it never clears
+or replaces their contents.
+
+Successful assets have credential-free records under
+`/workspace/.klein-hydration/model.json` and
+`/workspace/.klein-hydration/dataset.json`. They record requested and resolved
+revisions, local destinations, and selected model or dataset identity details.
+The records are written last. On a matching rerun, assets are revalidated and
+reused. A destination or record that cannot be proven to match the requested
+asset fails without overwrite. Private partial download staging can be reused
+only for the same requested immutable source; it never counts as completion.
+
+After hydration, invoke the existing preflight explicitly, then launch the
+existing trainer manually when it reports readiness:
+
+```bash
+python scripts/runpod_preflight.py --profile training \
+  --workspace /workspace \
+  --model-path /workspace/models/FLUX.2-klein-base-9B \
+  --dataset-path /workspace/datasets/training-dataset \
+  --output-path /workspace/runs/experiment
+```
+
+`/workspace` remains disposable. A Network Volume can reduce repeated download
+time later, but it is not required. Hydration does not export checkpoints or
+results, create Pods, start training, or establish a new GPU or
+deterministic-recovery qualification.
+
 ## Deterministic recovery relationship
 
 The image packages the code and dependency lock used by the qualified

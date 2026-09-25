@@ -279,13 +279,22 @@ def selected_remote_files(siblings):
     return selected
 
 
-def download_missing(root, revision, *, hub=None, progress=None):
+def resolve_model_source(repository, revision, *, hub=None, token=None, allow_cached_token=True, progress=None):
+    """Resolve a model source and its selected immutable file inventory.
+
+    ``download_missing`` remains the generic-Pod entry point.  Asset hydration
+    reuses this narrower resolver with an environment-only token, so it does
+    not need to duplicate the Base-9B inventory or gated-access policy.
+    """
     if progress:
         progress.start("Hugging Face access", "Verify cached login or pod secret access and gated license approval, then rerun setup.")
     if hub is None:
         import huggingface_hub as hub
     # HF_TOKEN takes precedence; get_token also understands the CLI credential cache.
-    token = os.environ.get("HF_TOKEN", "").strip() or hub.get_token()
+    if token is None:
+        token = os.environ.get("HF_TOKEN", "").strip()
+        if not token and allow_cached_token:
+            token = hub.get_token()
     if not token:
         raise BootstrapError("Model download requires authentication: set HF_TOKEN through pod secrets, or run hf auth login; accept the model's gated license first.")
     try:
@@ -293,13 +302,24 @@ def download_missing(root, revision, *, hub=None, progress=None):
         with quiet_hub():
             api = hub.HfApi(token=token)
             api.whoami()
-            api.auth_check(repo_id=MODEL_ID, repo_type="model")
-            info = api.model_info(MODEL_ID, revision=revision, files_metadata=True)
+            api.auth_check(repo_id=repository, repo_type="model")
+            info = api.model_info(repository, revision=revision, files_metadata=True)
     except Exception:
         raise BootstrapError("Hugging Face authentication/model access failed. Verify HF_TOKEN or hf auth login, gated license approval, token read permissions and network access.") from None
     if not re.fullmatch(r"[0-9a-f]{40}", info.sha or ""):
         raise BootstrapError("Hub did not resolve an immutable model revision.")
     inventory = selected_remote_files(info.siblings)
+    return {"repository": repository, "requested_revision": revision,
+            "revision": info.sha, "inventory": inventory, "hub": hub, "token": token}
+
+
+def download_model_source(root, source, *, progress=None):
+    """Download one already-resolved selected model source without overwrites."""
+    repository = source["repository"]
+    revision = source["revision"]
+    inventory = source["inventory"]
+    hub = source["hub"]
+    token = source["token"]
     missing = []
     for name, size in inventory.items():
         path = root / name
@@ -325,14 +345,21 @@ def download_missing(root, revision, *, hub=None, progress=None):
         with quiet_hub():
             hub.utils.disable_progress_bars()
             for name in missing:
-                hub.hf_hub_download(repo_id=MODEL_ID, filename=name, revision=info.sha,
+                hub.hf_hub_download(repo_id=repository, filename=name, revision=revision,
                                     local_dir=str(root), token=token, force_download=False)
     except Exception:
         raise BootstrapError("Model download failed. Partial Hub downloads are retained; rerun setup to resume. Check access, network and disk space.") from None
     for name, size in inventory.items():
         if not (root / name).is_file() or (root / name).stat().st_size != size:
             raise BootstrapError("Downloaded model inventory is incomplete or has incorrect sizes.")
-    return {"repository": MODEL_ID, "revision": info.sha, "downloaded_files": len(missing)}
+    return {"repository": repository, "revision": revision, "downloaded_files": len(missing)}
+
+
+def download_missing(root, revision, *, repository=MODEL_ID, hub=None, progress=None,
+                     token=None, allow_cached_token=True):
+    source = resolve_model_source(repository, revision, hub=hub, token=token,
+                                  allow_cached_token=allow_cached_token, progress=progress)
+    return download_model_source(root, source, progress=progress)
 
 
 def disk_report(paths):

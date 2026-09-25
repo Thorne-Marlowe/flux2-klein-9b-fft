@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "workspace_root": "/workspace",
+  "model": {
+    "repository": "black-forest-labs/FLUX.2-klein-base-9B",
+    "revision": "REPLACE_WITH_IMMUTABLE_40_CHARACTER_MODEL_COMMIT",
+    "destination": "/workspace/models/FLUX.2-klein-base-9B"
+  },
+  "dataset": {
+    "repository": "REPLACE_WITH_HUGGING_FACE_DATASET_REPOSITORY",
+    "revision": "REPLACE_WITH_IMMUTABLE_40_CHARACTER_DATASET_COMMIT",
+    "package_destination": "/workspace/cache/dataset-package",
+    "destination": "/workspace/datasets/training-dataset"
+  }
+}

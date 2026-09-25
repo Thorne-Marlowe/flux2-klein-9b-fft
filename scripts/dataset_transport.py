@@ -435,6 +435,12 @@ def _validate_extracted_directory(root: Path, manifest: dict[str, object]) -> No
     _validate_member_layout(list(expected.values()))
 
 
+def validate_extracted_dataset(dataset_dir: Path, manifest: dict[str, object]) -> None:
+    """Validate a previously extracted flat dataset against a package manifest."""
+    root = _normalise_root(Path(dataset_dir), "Extracted dataset")
+    _validate_extracted_directory(root, manifest)
+
+
 def extract_package(package_dir: Path, dataset_dir: Path) -> dict[str, object]:
     """Safely stage and atomically expose a verified flat training directory."""
     package = _normalise_root(Path(package_dir), "Package")
