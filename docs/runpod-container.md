@@ -221,3 +221,104 @@ not available here. The exact base digest, registry publishing, Runpod network
 volume behavior, GPU visibility, and runtime asset validation therefore remain
 to be checked in the image-build phase. No minimum VRAM or new qualification
 claim follows from this document.
+
+## GHCR publication (Phase 3)
+
+Phase 3 adds `.github/workflows/publish-container.yml`. It builds the existing
+Dockerfile once for Linux amd64, loads that image into the GitHub-hosted runner,
+validates the loaded image, and only then authenticates to GitHub Container
+Registry (GHCR) and pushes that same local image. It never rebuilds after
+validation. The registry digest is the deployment identity for a future Runpod
+template:
+
+```text
+ghcr.io/thorne-marlowe/flux2-klein-9b-fft@sha256:<digest>
+```
+
+Tags are discovery aliases and are not deployment identities. Manual
+publication from `master` publishes only `sha-<full-40-character-commit>`.
+A strict release tag `vX.Y.Z`, whose target is reachable from `origin/master`,
+publishes both `sha-<full-40-character-commit>` and `vX.Y.Z`. The workflow does
+not publish `latest`, `master`, `main`, development, or branch aliases. It
+refuses an already-existing semantic GHCR tag rather than overwriting it.
+
+### Triggers and package setup
+
+The workflow has two manual modes:
+
+```text
+Actions → Build and publish Klein container → Run workflow
+publish = false  # build and validate the selected ref only
+publish = true   # publish, permitted only from master
+```
+
+Manual validation has only `contents: read` permission and never logs in to
+GHCR, requests OIDC, creates an attestation, or publishes. Version-tag pushes
+matching `v*.*.*` enter the publication path but are rejected unless their
+names strictly match `vX.Y.Z` and their commits are reachable from `master`.
+There are no ordinary branch-push or pull-request triggers.
+
+The workflow uses GitHub's built-in `GITHUB_TOKEN` after validation, with
+`packages: write`, `attestations: write`, and `id-token: write` only on the
+publication job. No registry token is passed into the Docker build, build
+context, validation containers, tests, or BuildKit cache.
+
+After the first publication, set the GHCR package
+`ghcr.io/thorne-marlowe/flux2-klein-9b-fft` to **public** in its GitHub package
+settings if future Runpod Pods should pull it anonymously. A private package
+would instead require separate runtime registry credentials. The Dockerfile's
+OCI source label links the package to this repository.
+
+### Build identity and validation
+
+Publication explicitly supplies the immutable Docker Hub multi-platform index
+for `python:3.12.3-slim-bookworm`:
+
+```text
+python:3.12.3-slim-bookworm@sha256:afc139a0a640942491ec481ad8dda10f2c5b753f5c969393b12480155fe15a63
+```
+
+The build remains explicitly Linux amd64. The workflow also calculates the
+full checked-out Git commit and SHA-256 of the exact `requirements-smoke.txt`
+bytes, then passes both values and a non-placeholder environment version to
+the Dockerfile. It validates matching OCI labels and
+`.container-build-info.json` fields before publication.
+
+The local candidate validation checks Linux amd64 platform, entrypoint command
+passthrough and zero-argument idle behavior, `pip check`, core locked imports,
+the CUDA 12.8 PyTorch build, system-profile preflight JSON, both relevant CLI
+help paths, the practical CPU test suite, and the real Linux checkpoint
+no-replace rename test. Expected CPU-runner preflight warnings for missing GPU
+or `/workspace` are allowed; any preflight `FAIL` is rejected. It also checks
+that source, tests, docs, and requirements are present while `.git`, top-level
+runtime asset directories, model/checkpoint/archive formats, and common secret
+file types are absent. Qualification documentation and its small inventory
+remain source documentation; the archived qualification payload is excluded by
+`.dockerignore` and is rejected if it appears.
+
+BuildKit's GitHub Actions cache uses the `runpod-linux-amd64` scope. It is only
+a speed optimization and contains no model, dataset, runtime cache, or
+credential input. The workflow uses native amd64 GitHub runners and does not
+configure QEMU.
+
+After all tags resolve to the published digest, GitHub's native
+`actions/attest` action creates and pushes a SLSA build-provenance attestation
+for that exact digest. SBOM publication is intentionally deferred. The job
+summary and publication-job outputs record the immutable image reference,
+commit, requirements-lock digest, pinned Python base, environment version,
+published tags, validation result, workflow URL, and attestation URL.
+
+### Evidence boundary and reproducibility limits
+
+A successful publication establishes that the digest-pinned Linux amd64 image
+was built from the recorded commit with the recorded base-image and lock-file
+digests, passed the listed CPU/container gates, and that exact validated image
+was pushed to GHCR and provenance-attested. It does not requalify Base 9B GPU
+execution, deterministic recovery, Runpod network-volume semantics, or
+production training behavior.
+
+`requirements-smoke.txt` pins package versions but not individual wheel hashes.
+The image also installs `libgomp1` from a live Debian repository without a
+Debian snapshot or package-version pin. Phase 3 therefore provides traceable,
+content-addressed deployment through the final registry digest; it does not
+guarantee byte-for-byte identical future rebuilds from the same source commit.
