@@ -1,0 +1,282 @@
+name: Build and publish Klein container
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a validated master image to GHCR.
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*.*.*"
+
+# Jobs grant only the permissions their path needs. A manual validation has no
+# package write, attestation, or OIDC capability.
+permissions: {}
+
+concurrency:
+  group: klein-container-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/thorne-marlowe/flux2-klein-9b-fft
+  # Official Docker Hub multi-platform index for python:3.12.3-slim-bookworm.
+  PYTHON_BASE_IMAGE: python:3.12.3-slim-bookworm@sha256:afc139a0a640942491ec481ad8dda10f2c5b753f5c969393b12480155fe15a63
+  CANDIDATE_IMAGE: local/flux2-klein-9b-fft:${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  validate:
+    name: Build and validate image
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Check out selected ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Calculate validation build identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          [[ "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${source_commit}" == "${GITHUB_SHA}" ]]
+          lock_sha256="$(sha256sum requirements-smoke.txt | awk '{print $1}')"
+          [[ "${lock_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "source_commit=${source_commit}" >> "$GITHUB_OUTPUT"
+          echo "environment_version=validation-sha-${source_commit}" >> "$GITHUB_OUTPUT"
+          echo "lock_sha256=${lock_sha256}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build local Linux amd64 candidate
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          pull: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.CANDIDATE_IMAGE }}
+          build-args: |
+            PYTHON_BASE_IMAGE=${{ env.PYTHON_BASE_IMAGE }}
+            SOURCE_COMMIT=${{ steps.identity.outputs.source_commit }}
+            ENVIRONMENT_VERSION=${{ steps.identity.outputs.environment_version }}
+            REQUIREMENTS_LOCK_SHA256=${{ steps.identity.outputs.lock_sha256 }}
+          cache-from: type=gha,scope=runpod-linux-amd64
+          cache-to: type=gha,mode=max,scope=runpod-linux-amd64
+
+      - name: Validate exact locally loaded candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash docker/validate-image.sh "${CANDIDATE_IMAGE}" \
+            "${{ steps.identity.outputs.source_commit }}" \
+            "${{ steps.identity.outputs.environment_version }}" \
+            "${{ steps.identity.outputs.lock_sha256 }}"
+
+  reject_manual_publication:
+    name: Reject manual publication outside master
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref != 'refs/heads/master' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Explain publication boundary
+        shell: bash
+        run: |
+          echo "Manual publication is permitted only from refs/heads/master; got ${GITHUB_REF}." >&2
+          exit 1
+
+  publish:
+    name: Build, validate, and publish image
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref == 'refs/heads/master') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+      digest: ${{ steps.publish.outputs.digest }}
+    steps:
+      - name: Check out publication ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate publication ref and calculate build identity
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git rev-parse HEAD)"
+          [[ "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "${source_commit}" == "${GITHUB_SHA}" ]]
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            [[ "${GITHUB_REF_TYPE}" == "tag" ]]
+            [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "Rejected release tag ${GITHUB_REF_NAME@Q}: expected vX.Y.Z." >&2
+              exit 1
+            }
+            git fetch --no-tags origin +refs/heads/master:refs/remotes/origin/master
+            git merge-base --is-ancestor "${source_commit}" origin/master || {
+              echo "Rejected release tag ${GITHUB_REF_NAME@Q}: its commit is not reachable from origin/master." >&2
+              exit 1
+            }
+            environment_version="${GITHUB_REF_NAME}"
+            version_tag="${GITHUB_REF_NAME}"
+          else
+            [[ "${GITHUB_REF}" == "refs/heads/master" ]] || {
+              echo "Manual publication must run from refs/heads/master." >&2
+              exit 1
+            }
+            environment_version="sha-${source_commit}"
+            version_tag=""
+          fi
+          lock_sha256="$(sha256sum requirements-smoke.txt | awk '{print $1}')"
+          [[ "${lock_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          echo "source_commit=${source_commit}" >> "$GITHUB_OUTPUT"
+          echo "environment_version=${environment_version}" >> "$GITHUB_OUTPUT"
+          echo "lock_sha256=${lock_sha256}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-${source_commit}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${version_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build local Linux amd64 candidate
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          pull: true
+          provenance: false
+          sbom: false
+          tags: ${{ env.CANDIDATE_IMAGE }}
+          build-args: |
+            PYTHON_BASE_IMAGE=${{ env.PYTHON_BASE_IMAGE }}
+            SOURCE_COMMIT=${{ steps.identity.outputs.source_commit }}
+            ENVIRONMENT_VERSION=${{ steps.identity.outputs.environment_version }}
+            REQUIREMENTS_LOCK_SHA256=${{ steps.identity.outputs.lock_sha256 }}
+          cache-from: type=gha,scope=runpod-linux-amd64
+          cache-to: type=gha,mode=max,scope=runpod-linux-amd64
+
+      - name: Record validated local image ID
+        id: local_image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_id="$(docker image inspect --format '{{.Id}}' "${CANDIDATE_IMAGE}")"
+          [[ -n "${image_id}" ]]
+          echo "image_id=${image_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate exact locally loaded candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash docker/validate-image.sh "${CANDIDATE_IMAGE}" \
+            "${{ steps.identity.outputs.source_commit }}" \
+            "${{ steps.identity.outputs.environment_version }}" \
+            "${{ steps.identity.outputs.lock_sha256 }}"
+
+      - name: Log in to GitHub Container Registry after validation
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse an existing semantic release tag
+        if: ${{ steps.identity.outputs.version_tag != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${IMAGE_NAME}:${{ steps.identity.outputs.version_tag }}" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing semantic GHCR tag ${{ steps.identity.outputs.version_tag }}." >&2
+            exit 1
+          fi
+
+      - name: Publish the validated local image
+        id: publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          validated_id="${{ steps.local_image.outputs.image_id }}"
+          current_id="$(docker image inspect --format '{{.Id}}' "${CANDIDATE_IMAGE}")"
+          [[ "${current_id}" == "${validated_id}" ]] || {
+            echo "The locally loaded candidate changed after validation." >&2
+            exit 1
+          }
+          sha_ref="${IMAGE_NAME}:${{ steps.identity.outputs.sha_tag }}"
+          docker tag "${validated_id}" "${sha_ref}"
+          docker push "${sha_ref}"
+          digest="$(docker buildx imagetools inspect "${sha_ref}" | awk '/^Digest:[[:space:]]+/ { print $2; exit }')"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "Could not obtain a remote GHCR digest for ${sha_ref}." >&2
+            exit 1
+          }
+          tags="${{ steps.identity.outputs.sha_tag }}"
+          if [[ -n "${{ steps.identity.outputs.version_tag }}" ]]; then
+            version_ref="${IMAGE_NAME}:${{ steps.identity.outputs.version_tag }}"
+            docker tag "${validated_id}" "${version_ref}"
+            docker push "${version_ref}"
+            tags+=$'\n'"${{ steps.identity.outputs.version_tag }}"
+          fi
+          while IFS= read -r tag; do
+            remote="$(docker buildx imagetools inspect "${IMAGE_NAME}:${tag}" | awk '/^Digest:[[:space:]]+/ { print $2; exit }')"
+            [[ "${remote}" == "${digest}" ]] || {
+              echo "GHCR tag ${tag} did not resolve to the validated digest ${digest}." >&2
+              exit 1
+            }
+          done <<<"${tags}"
+          image="${IMAGE_NAME}@${digest}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${tags}" > published-tags.txt
+
+      - name: Attest published image provenance
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Publish release summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Klein container publication"
+            echo
+            echo "- Immutable image: \`${{ steps.publish.outputs.image }}\`"
+            echo "- Source commit: \`${{ steps.identity.outputs.source_commit }}\`"
+            echo "- Requirements lock SHA-256: \`${{ steps.identity.outputs.lock_sha256 }}\`"
+            echo "- Python base: \`${PYTHON_BASE_IMAGE}\`"
+            echo "- Environment version: \`${{ steps.identity.outputs.environment_version }}\`"
+            echo "- Published tags:"
+            sed 's/^/  - `/' published-tags.txt | sed 's/$/`/'
+            echo "- Validation: passed before GHCR login and publication"
+            echo "- Workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- Provenance: ${{ steps.attest.outputs.attestation-url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
